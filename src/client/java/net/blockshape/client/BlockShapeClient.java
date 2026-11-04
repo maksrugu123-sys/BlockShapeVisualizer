@@ -38,12 +38,16 @@ import java.util.Properties;
 public final class BlockShapeClient implements ClientModInitializer {
     private static final int MIN_RADIUS = 2;
     private static final int MAX_RADIUS = 16;
+    private static final int MIN_VERTICAL_RANGE = 0;
+    private static final int MAX_VERTICAL_RANGE = 16;
     private static final int REFRESH_INTERVAL_TICKS = 5;
     private static final Path CONFIG_FILE = FabricLoader.getInstance().getConfigDir()
             .resolve("blockshape-visualizer.properties");
 
     private static boolean enabled = true;
     private static int radius = 6;
+    private static int downRange = 3;
+    private static int upRange = 3;
     private static float lineWidth = 2.0f;
     private static boolean perBlockColors = true;
     private static int fixedColor = 0xFF35D7FF;
@@ -74,18 +78,20 @@ public final class BlockShapeClient implements ClientModInitializer {
 
     private static void rebuildCache(Level level, Player player) {
         int r = radius;
+        int down = downRange;
+        int up = upRange;
         BlockPos origin = player.blockPosition();
         BlockPos.MutableBlockPos cursor = new BlockPos.MutableBlockPos();
         CollisionContext collisionContext = CollisionContext.of(player);
         List<ShapeEntry> result = new ArrayList<>();
         int radiusSquared = r * r;
-        Vec3 eyePosition = player.getEyePosition();
-        Vec3 lookDirection = player.getLookAngle();
 
-        for (int y = -r; y <= r; y++) {
+        // Vertical limits are independent of the horizontal search radius.
+        // Defaults show up to 3 blocks above and 3 blocks below the player.
+        for (int y = -down; y <= up; y++) {
             for (int z = -r; z <= r; z++) {
                 for (int x = -r; x <= r; x++) {
-                    if (x * x + y * y + z * z > radiusSquared) continue;
+                    if (x * x + z * z > radiusSquared) continue;
                     cursor.set(origin.getX() + x, origin.getY() + y, origin.getZ() + z);
                     if (!level.hasChunkAt(cursor)) continue;
 
@@ -93,51 +99,12 @@ public final class BlockShapeClient implements ClientModInitializer {
                     VoxelShape shape = state.getCollisionShape(level, cursor, collisionContext);
                     if (shape.isEmpty()) continue;
 
-                    // Keep candidates in the forward hemisphere. Actual visibility is
-                    // determined per pixel by the normal depth-tested outline renderer.
-                    // Do not ray-filter individual shapes here: a center/face ray can miss
-                    // a genuinely visible edge or partial surface and create gaps.
-                    if (!isInForwardHemisphere(eyePosition, lookDirection, cursor, shape)) continue;
-
                     int color = perBlockColors ? colorForBlock(state) : fixedColor;
                     result.add(new ShapeEntry(cursor.immutable(), shape, color));
                 }
             }
         }
         cachedShapes = List.copyOf(result);
-    }
-
-    /**
-     * Keep shapes whose bounding box intersects the forward 180-degree
-     * hemisphere around the camera direction. Testing the whole box (rather
-     * than only its center) prevents partially exposed tall/sloped shapes from
-     * disappearing at the hemisphere boundary. Per-pixel depth testing in the
-     * normal renderer still hides the parts occluded by terrain and walls.
-     */
-    private static boolean isInForwardHemisphere(
-            Vec3 eyePosition,
-            Vec3 lookDirection,
-            BlockPos pos,
-            VoxelShape shape
-    ) {
-        AABB bounds = shape.bounds();
-        double halfX = (bounds.maxX - bounds.minX) * 0.5;
-        double halfY = (bounds.maxY - bounds.minY) * 0.5;
-        double halfZ = (bounds.maxZ - bounds.minZ) * 0.5;
-
-        Vec3 center = new Vec3(
-                pos.getX() + (bounds.minX + bounds.maxX) * 0.5,
-                pos.getY() + (bounds.minY + bounds.maxY) * 0.5,
-                pos.getZ() + (bounds.minZ + bounds.maxZ) * 0.5
-        );
-        Vec3 toCenter = center.subtract(eyePosition);
-
-        // Project the AABB half-extents onto the look direction. A shape is a
-        // candidate when any part of its bounds reaches the forward half-space.
-        double projectedHalfExtent = Math.abs(lookDirection.x) * halfX
-                + Math.abs(lookDirection.y) * halfY
-                + Math.abs(lookDirection.z) * halfZ;
-        return toCenter.dot(lookDirection) + projectedHalfExtent >= -1.0E-4;
     }
 
     private static int colorForBlock(BlockState state) {
@@ -198,9 +165,9 @@ public final class BlockShapeClient implements ClientModInitializer {
                 dispatcher.register(ClientCommands.literal("bshape")
                         .executes(context -> {
                             feedback(context.getSource(), "BlockShape: " + (enabled ? "ON" : "OFF")
-                                    + ", radius=" + radius + ", width=" + lineWidth
+                                    + ", radius=" + radius + ", down=" + downRange + ", up=" + upRange + ", width=" + lineWidth
                                     + ", colors=" + (perBlockColors ? "per-block" : "fixed"));
-                            feedback(context.getSource(), "Commands: /bshape on|off|toggle|radius <2..16>|width <1..6>|color rainbow|color RRGGBB");
+                            feedback(context.getSource(), "Commands: /bshape on|off|toggle|radius <2..16>|down <0..16>|up <0..16>|width <1..6>|color rainbow|color RRGGBB");
                             return 1;
                         })
                         .then(ClientCommands.literal("on").executes(context -> setEnabled(context.getSource(), true)))
@@ -212,6 +179,22 @@ public final class BlockShapeClient implements ClientModInitializer {
                                     ticksSinceRefresh = REFRESH_INTERVAL_TICKS;
                                     saveConfig();
                                     feedback(context.getSource(), "Display radius: " + radius + " blocks");
+                                    return 1;
+                                })))
+                        .then(ClientCommands.literal("down").then(ClientCommands.argument("blocks", IntegerArgumentType.integer(MIN_VERTICAL_RANGE, MAX_VERTICAL_RANGE))
+                                .executes(context -> {
+                                    downRange = IntegerArgumentType.getInteger(context, "blocks");
+                                    ticksSinceRefresh = REFRESH_INTERVAL_TICKS;
+                                    saveConfig();
+                                    feedback(context.getSource(), "Visible range below player: " + downRange + " blocks");
+                                    return 1;
+                                })))
+                        .then(ClientCommands.literal("up").then(ClientCommands.argument("blocks", IntegerArgumentType.integer(MIN_VERTICAL_RANGE, MAX_VERTICAL_RANGE))
+                                .executes(context -> {
+                                    upRange = IntegerArgumentType.getInteger(context, "blocks");
+                                    ticksSinceRefresh = REFRESH_INTERVAL_TICKS;
+                                    saveConfig();
+                                    feedback(context.getSource(), "Visible range above player: " + upRange + " blocks");
                                     return 1;
                                 })))
                         .then(ClientCommands.literal("width").then(ClientCommands.argument("pixels", FloatArgumentType.floatArg(1.0f, 6.0f))
@@ -264,6 +247,8 @@ public final class BlockShapeClient implements ClientModInitializer {
             properties.load(reader);
             enabled = Boolean.parseBoolean(properties.getProperty("enabled", "true"));
             radius = clamp(parseInt(properties.getProperty("radius"), 6), MIN_RADIUS, MAX_RADIUS);
+            downRange = clamp(parseInt(properties.getProperty("downRange"), 3), MIN_VERTICAL_RANGE, MAX_VERTICAL_RANGE);
+            upRange = clamp(parseInt(properties.getProperty("upRange"), 3), MIN_VERTICAL_RANGE, MAX_VERTICAL_RANGE);
             lineWidth = Math.max(1.0f, Math.min(6.0f, parseFloat(properties.getProperty("lineWidth"), 2.0f)));
             perBlockColors = Boolean.parseBoolean(properties.getProperty("perBlockColors", "true"));
             fixedColor = (int) Long.parseLong(properties.getProperty("fixedColor", "FF35D7FF"), 16);
@@ -277,6 +262,8 @@ public final class BlockShapeClient implements ClientModInitializer {
         Properties properties = new Properties();
         properties.setProperty("enabled", Boolean.toString(enabled));
         properties.setProperty("radius", Integer.toString(radius));
+        properties.setProperty("downRange", Integer.toString(downRange));
+        properties.setProperty("upRange", Integer.toString(upRange));
         properties.setProperty("lineWidth", Float.toString(lineWidth));
         properties.setProperty("perBlockColors", Boolean.toString(perBlockColors));
         properties.setProperty("fixedColor", String.format("%06X", fixedColor & 0x00FFFFFF));
