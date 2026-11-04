@@ -1,6 +1,9 @@
 name: Build BlockShape
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
 
 jobs:
   build:
