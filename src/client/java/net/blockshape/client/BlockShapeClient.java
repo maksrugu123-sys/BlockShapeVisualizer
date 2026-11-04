@@ -79,6 +79,8 @@ public final class BlockShapeClient implements ClientModInitializer {
         CollisionContext collisionContext = CollisionContext.of(player);
         List<ShapeEntry> result = new ArrayList<>();
         int radiusSquared = r * r;
+        Vec3 eyePosition = player.getEyePosition();
+        Vec3 lookDirection = player.getLookAngle();
 
         for (int y = -r; y <= r; y++) {
             for (int z = -r; z <= r; z++) {
@@ -95,7 +97,7 @@ public final class BlockShapeClient implements ClientModInitializer {
                     // determined per pixel by the normal depth-tested outline renderer.
                     // Do not ray-filter individual shapes here: a center/face ray can miss
                     // a genuinely visible edge or partial surface and create gaps.
-                    if (!isInForwardHemisphere(player, cursor, shape)) continue;
+                    if (!isInForwardHemisphere(eyePosition, lookDirection, cursor, shape)) continue;
 
                     int color = perBlockColors ? colorForBlock(state) : fixedColor;
                     result.add(new ShapeEntry(cursor.immutable(), shape, color));
@@ -106,20 +108,36 @@ public final class BlockShapeClient implements ClientModInitializer {
     }
 
     /**
-     * Restrict outline candidates to the forward 180-degree field around the
-     * player's look direction. Per-pixel depth testing in the renderer decides
-     * which parts of each shape are actually visible.
+     * Keep shapes whose bounding box intersects the forward 180-degree
+     * hemisphere around the camera direction. Testing the whole box (rather
+     * than only its center) prevents partially exposed tall/sloped shapes from
+     * disappearing at the hemisphere boundary. Per-pixel depth testing in the
+     * normal renderer still hides the parts occluded by terrain and walls.
      */
-    private static boolean isInForwardHemisphere(Player player, BlockPos pos, VoxelShape shape) {
+    private static boolean isInForwardHemisphere(
+            Vec3 eyePosition,
+            Vec3 lookDirection,
+            BlockPos pos,
+            VoxelShape shape
+    ) {
         AABB bounds = shape.bounds();
+        double halfX = (bounds.maxX - bounds.minX) * 0.5;
+        double halfY = (bounds.maxY - bounds.minY) * 0.5;
+        double halfZ = (bounds.maxZ - bounds.minZ) * 0.5;
+
         Vec3 center = new Vec3(
                 pos.getX() + (bounds.minX + bounds.maxX) * 0.5,
                 pos.getY() + (bounds.minY + bounds.maxY) * 0.5,
                 pos.getZ() + (bounds.minZ + bounds.maxZ) * 0.5
         );
-        Vec3 toBlock = center.subtract(player.getEyePosition());
-        return toBlock.lengthSqr() >= 1.0E-6
-                && toBlock.normalize().dot(player.getLookAngle()) >= 0.0;
+        Vec3 toCenter = center.subtract(eyePosition);
+
+        // Project the AABB half-extents onto the look direction. A shape is a
+        // candidate when any part of its bounds reaches the forward half-space.
+        double projectedHalfExtent = Math.abs(lookDirection.x) * halfX
+                + Math.abs(lookDirection.y) * halfY
+                + Math.abs(lookDirection.z) * halfZ;
+        return toCenter.dot(lookDirection) + projectedHalfExtent >= -1.0E-4;
     }
 
     private static int colorForBlock(BlockState state) {
