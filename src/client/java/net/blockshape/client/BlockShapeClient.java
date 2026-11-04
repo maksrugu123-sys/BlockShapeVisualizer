@@ -119,6 +119,16 @@ public final class BlockShapeClient implements ClientModInitializer {
                 pos.getY() + (bounds.minY + bounds.maxY) * 0.5,
                 pos.getZ() + (bounds.minZ + bounds.maxZ) * 0.5
         );
+
+        // Keep only the forward 180-degree hemisphere around the player's view.
+        // The dot product is positive for points in front, zero at the sides,
+        // and negative for points behind the player.
+        Vec3 toBlock = center.subtract(eye);
+        if (toBlock.lengthSqr() < 1.0E-6
+                || toBlock.normalize().dot(player.getLookAngle()) < 0.0) {
+            return false;
+        }
+
         if (hasClearRayToBlock(level, player, eye, center, pos)) {
             return true;
         }
