@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - fix/3d-forward-visibility
 
 jobs:
   build:
