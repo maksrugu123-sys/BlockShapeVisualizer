@@ -93,9 +93,11 @@ public final class BlockShapeClient implements ClientModInitializer {
                     VoxelShape shape = state.getCollisionShape(level, cursor, collisionContext);
                     if (shape.isEmpty()) continue;
 
-                    // Reject blocks whose collision shape is completely hidden behind
-                    // another collidable block from the player's current viewpoint.
-                    if (!isVisibleFromEye(level, player, cursor, shape)) continue;
+                    // Keep candidates in the forward hemisphere. Actual visibility is
+                    // determined per pixel by the normal depth-tested outline renderer.
+                    // Do not ray-filter individual shapes here: a center/face ray can miss
+                    // a genuinely visible edge or partial surface and create gaps.
+                    if (!isInForwardHemisphere(player, cursor, shape)) continue;
 
                     int color = perBlockColors ? colorForBlock(state) : fixedColor;
                     result.add(new ShapeEntry(cursor.immutable(), shape, color));
@@ -103,6 +105,23 @@ public final class BlockShapeClient implements ClientModInitializer {
             }
         }
         cachedShapes = List.copyOf(result);
+    }
+
+    /**
+     * Restrict outline candidates to the forward 180-degree field around the
+     * player's look direction. Per-pixel depth testing in the renderer decides
+     * which parts of each shape are actually visible.
+     */
+    private static boolean isInForwardHemisphere(Player player, BlockPos pos, VoxelShape shape) {
+        AABB bounds = shape.bounds();
+        Vec3 center = new Vec3(
+                pos.getX() + (bounds.minX + bounds.maxX) * 0.5,
+                pos.getY() + (bounds.minY + bounds.maxY) * 0.5,
+                pos.getZ() + (bounds.minZ + bounds.maxZ) * 0.5
+        );
+        Vec3 toBlock = center.subtract(player.getEyePosition());
+        return toBlock.lengthSqr() >= 1.0E-6
+                && toBlock.normalize().dot(player.getLookAngle()) >= 0.0;
     }
 
     /**
