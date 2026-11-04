@@ -145,7 +145,7 @@ public final class BlockShapeClient implements ClientModInitializer {
                     RenderTypes.lines(),
                     entry.color(),
                     lineWidth,
-                    true
+                    false
             );
             poseStack.popPose();
         }
