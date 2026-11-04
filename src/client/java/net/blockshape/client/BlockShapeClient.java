@@ -18,6 +18,9 @@ import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.chat.Component;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.level.ClipContext;
+import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.phys.shapes.CollisionContext;
@@ -90,12 +93,73 @@ public final class BlockShapeClient implements ClientModInitializer {
                     VoxelShape shape = state.getCollisionShape(level, cursor, collisionContext);
                     if (shape.isEmpty()) continue;
 
+                    // Reject blocks whose collision shape is completely hidden behind
+                    // another collidable block from the player's current viewpoint.
+                    if (!isVisibleFromEye(level, player, cursor, shape)) continue;
+
                     int color = perBlockColors ? colorForBlock(state) : fixedColor;
                     result.add(new ShapeEntry(cursor.immutable(), shape, color));
                 }
             }
         }
         cachedShapes = List.copyOf(result);
+    }
+
+    /**
+     * A cheap line-of-sight pre-filter. The normal render pipeline still performs
+     * per-pixel depth testing; this additionally prevents fully buried block shapes
+     * from entering the outline submission list at all.
+     */
+    private static boolean isVisibleFromEye(Level level, Player player, BlockPos pos, VoxelShape shape) {
+        Vec3 eye = player.getEyePosition();
+        AABB bounds = shape.bounds();
+
+        Vec3 center = new Vec3(
+                pos.getX() + (bounds.minX + bounds.maxX) * 0.5,
+                pos.getY() + (bounds.minY + bounds.maxY) * 0.5,
+                pos.getZ() + (bounds.minZ + bounds.maxZ) * 0.5
+        );
+        if (hasClearRayToBlock(level, player, eye, center, pos)) {
+            return true;
+        }
+
+        // Also sample the collision shape's face nearest to the player. This keeps
+        // partially exposed shapes from being discarded just because their center
+        // is hidden by a corner or an adjacent block.
+        double dx = eye.x - center.x;
+        double dy = eye.y - center.y;
+        double dz = eye.z - center.z;
+        double sampleX = center.x;
+        double sampleY = center.y;
+        double sampleZ = center.z;
+        if (Math.abs(dx) >= Math.abs(dy) && Math.abs(dx) >= Math.abs(dz)) {
+            sampleX = pos.getX() + (dx >= 0.0 ? bounds.maxX : bounds.minX);
+            sampleX += dx >= 0.0 ? -0.001 : 0.001;
+        } else if (Math.abs(dy) >= Math.abs(dz)) {
+            sampleY = pos.getY() + (dy >= 0.0 ? bounds.maxY : bounds.minY);
+            sampleY += dy >= 0.0 ? -0.001 : 0.001;
+        } else {
+            sampleZ = pos.getZ() + (dz >= 0.0 ? bounds.maxZ : bounds.minZ);
+            sampleZ += dz >= 0.0 ? -0.001 : 0.001;
+        }
+
+        Vec3 nearFace = new Vec3(sampleX, sampleY, sampleZ);
+        return hasClearRayToBlock(level, player, eye, nearFace, pos);
+    }
+
+    private static boolean hasClearRayToBlock(Level level, Player player, Vec3 eye, Vec3 target, BlockPos expectedPos) {
+        if (eye.distanceToSqr(target) < 1.0E-6) {
+            return true;
+        }
+
+        var hit = level.clip(new ClipContext(
+                eye,
+                target,
+                ClipContext.Block.COLLIDER,
+                ClipContext.Fluid.NONE,
+                player
+        ));
+        return hit.getType() == HitResult.Type.BLOCK && hit.getBlockPos().equals(expectedPos);
     }
 
     private static int colorForBlock(BlockState state) {
