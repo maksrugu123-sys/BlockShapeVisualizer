@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "blockshape",
+  "version": "${version}",
+  "name": "Block Shape Visualizer",
+  "description": "Client-side collision-shape outlines around the player, with per-block colors and adjustable range.",
+  "environment": "client",
+  "entrypoints": {
+    "client": ["net.blockshape.client.BlockShapeClient"]
+  },
+  "depends": {
+    "fabricloader": ">=0.20.1",
+    "minecraft": "26.3",
+    "java": ">=25",
+    "fabric-api": "*"
+  }
+}
