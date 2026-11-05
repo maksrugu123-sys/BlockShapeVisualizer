@@ -3,6 +3,7 @@ package net.blockshape.client;
 import com.mojang.brigadier.arguments.FloatArgumentType;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
+import com.mojang.blaze3d.vertex.PoseStack;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommands;
@@ -11,18 +12,24 @@ import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.rendering.v1.level.LevelRenderEvents;
 import net.fabricmc.fabric.api.client.rendering.v1.level.LevelRenderContext;
 import net.fabricmc.loader.api.FabricLoader;
-import net.minecraft.client.renderer.rendertype.RenderTypes;
+import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.SubmitNodeCollector;
+import net.minecraft.client.renderer.block.BlockModelRenderState;
+import net.minecraft.client.renderer.block.model.BlockDisplayContext;
+import net.minecraft.client.renderer.block.model.BlockModel;
+import net.minecraft.client.renderer.rendertype.RenderTypes;
+import net.minecraft.client.renderer.texture.OverlayTexture;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.chat.Component;
+import net.minecraft.util.LightCoordsUtil;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.level.Level;
-import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.level.block.RenderShape;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.phys.shapes.CollisionContext;
 import net.minecraft.world.phys.shapes.VoxelShape;
-import com.mojang.blaze3d.vertex.PoseStack;
 
 import java.io.IOException;
 import java.io.Reader;
@@ -42,8 +49,10 @@ public final class BlockShapeClient implements ClientModInitializer {
     private static final int REFRESH_INTERVAL_TICKS = 5;
     private static final Path CONFIG_FILE = FabricLoader.getInstance().getConfigDir()
             .resolve("blockshape-visualizer.properties");
+    private static final BlockDisplayContext BLOCK_DISPLAY_CONTEXT = BlockDisplayContext.create();
 
     private static boolean enabled = true;
+    private static boolean renderHiddenTextures = true;
     private static int radius = 6;
     private static int downRange = 3;
     private static int upRange = 3;
@@ -53,7 +62,7 @@ public final class BlockShapeClient implements ClientModInitializer {
     private static int ticksSinceRefresh = REFRESH_INTERVAL_TICKS;
     private static List<ShapeEntry> cachedShapes = List.of();
 
-    private record ShapeEntry(BlockPos pos, VoxelShape shape, int color) {}
+    private record ShapeEntry(BlockPos pos, BlockState state, VoxelShape shape, int color) {}
 
     @Override
     public void onInitializeClient() {
@@ -99,7 +108,7 @@ public final class BlockShapeClient implements ClientModInitializer {
                     if (shape.isEmpty()) continue;
 
                     int color = perBlockColors ? colorForBlock(state) : fixedColor;
-                    result.add(new ShapeEntry(cursor.immutable(), shape, color));
+                    result.add(new ShapeEntry(cursor.immutable(), state, shape, color));
                 }
             }
         }
@@ -136,9 +145,13 @@ public final class BlockShapeClient implements ClientModInitializer {
     private void submitShapes(LevelRenderContext context) {
         if (!enabled || cachedShapes.isEmpty()) return;
 
+        Level level = Minecraft.getInstance().level;
+        if (level == null) return;
+
         Vec3 camera = context.levelState().cameraRenderState.pos;
         PoseStack poseStack = context.poseStack();
         SubmitNodeCollector collector = context.submitNodeCollector();
+        BlockModelRenderState modelRenderState = new BlockModelRenderState();
 
         for (ShapeEntry entry : cachedShapes) {
             poseStack.pushPose();
@@ -147,6 +160,33 @@ public final class BlockShapeClient implements ClientModInitializer {
                     entry.pos().getY() - camera.y,
                     entry.pos().getZ() - camera.z
             );
+
+            // BlockHider marks world blocks INVISIBLE but keeps their baked models
+            // and the block texture atlas loaded. Submit those original models here.
+            // Normal visible blocks stay on the vanilla path, avoiding z-fighting.
+            if (renderHiddenTextures && entry.state().getRenderShape() == RenderShape.INVISIBLE) {
+                try {
+                    modelRenderState.clear();
+                    BlockModel model = Minecraft.getInstance().getModelManager()
+                            .getBlockModelSet().get(entry.state());
+                    model.update(
+                            modelRenderState,
+                            entry.state(),
+                            BLOCK_DISPLAY_CONTEXT,
+                            entry.state().getSeed(entry.pos())
+                    );
+                    modelRenderState.submit(
+                            poseStack,
+                            collector,
+                            LightCoordsUtil.getLightCoords(level, entry.pos()),
+                            OverlayTexture.NO_OVERLAY,
+                            0
+                    );
+                } catch (RuntimeException ignored) {
+                    // An unsupported third-party model must not break the whole world render.
+                }
+            }
+
             collector.submitShapeOutline(
                     poseStack,
                     entry.shape(),
@@ -165,13 +205,17 @@ public final class BlockShapeClient implements ClientModInitializer {
                         .executes(context -> {
                             feedback(context.getSource(), "BlockShape: " + (enabled ? "ON" : "OFF")
                                     + ", radius=" + radius + ", down=" + downRange + ", up=" + upRange + ", width=" + lineWidth
-                                    + ", colors=" + (perBlockColors ? "per-block" : "fixed"));
-                            feedback(context.getSource(), "Commands: /bshape on|off|toggle|radius <2..16>|down <0..16>|up <0..16>|width <1..6>|color rainbow|color RRGGBB");
+                                    + ", colors=" + (perBlockColors ? "per-block" : "fixed")
+                                    + ", hidden textures=" + (renderHiddenTextures ? "ON" : "OFF"));
+                            feedback(context.getSource(), "Commands: /bshape on|off|toggle|textures on|off|radius <2..16>|down <0..16>|up <0..16>|width <1..6>|color rainbow|color RRGGBB");
                             return 1;
                         })
                         .then(ClientCommands.literal("on").executes(context -> setEnabled(context.getSource(), true)))
                         .then(ClientCommands.literal("off").executes(context -> setEnabled(context.getSource(), false)))
                         .then(ClientCommands.literal("toggle").executes(context -> setEnabled(context.getSource(), !enabled)))
+                        .then(ClientCommands.literal("textures")
+                                .then(ClientCommands.literal("on").executes(context -> setHiddenTextures(context.getSource(), true)))
+                                .then(ClientCommands.literal("off").executes(context -> setHiddenTextures(context.getSource(), false))))
                         .then(ClientCommands.literal("radius").then(ClientCommands.argument("blocks", IntegerArgumentType.integer(MIN_RADIUS, MAX_RADIUS))
                                 .executes(context -> {
                                     radius = IntegerArgumentType.getInteger(context, "blocks");
@@ -235,6 +279,13 @@ public final class BlockShapeClient implements ClientModInitializer {
         return 1;
     }
 
+    private static int setHiddenTextures(FabricClientCommandSource source, boolean value) {
+        renderHiddenTextures = value;
+        saveConfig();
+        feedback(source, "Hidden block textures: " + (renderHiddenTextures ? "enabled" : "disabled"));
+        return 1;
+    }
+
     private static void feedback(FabricClientCommandSource source, String message) {
         source.sendFeedback(Component.literal("[BlockShape] " + message));
     }
@@ -245,6 +296,7 @@ public final class BlockShapeClient implements ClientModInitializer {
         try (Reader reader = Files.newBufferedReader(CONFIG_FILE)) {
             properties.load(reader);
             enabled = Boolean.parseBoolean(properties.getProperty("enabled", "true"));
+            renderHiddenTextures = Boolean.parseBoolean(properties.getProperty("renderHiddenTextures", "true"));
             radius = clamp(parseInt(properties.getProperty("radius"), 6), MIN_RADIUS, MAX_RADIUS);
             downRange = clamp(parseInt(properties.getProperty("downRange"), 3), MIN_VERTICAL_RANGE, MAX_VERTICAL_RANGE);
             upRange = clamp(parseInt(properties.getProperty("upRange"), 3), MIN_VERTICAL_RANGE, MAX_VERTICAL_RANGE);
@@ -260,6 +312,7 @@ public final class BlockShapeClient implements ClientModInitializer {
     private static void saveConfig() {
         Properties properties = new Properties();
         properties.setProperty("enabled", Boolean.toString(enabled));
+        properties.setProperty("renderHiddenTextures", Boolean.toString(renderHiddenTextures));
         properties.setProperty("radius", Integer.toString(radius));
         properties.setProperty("downRange", Integer.toString(downRange));
         properties.setProperty("upRange", Integer.toString(upRange));
