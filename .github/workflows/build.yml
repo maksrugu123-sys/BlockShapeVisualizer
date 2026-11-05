@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - fix/3d-forward-visibility
+      - fix/world-native-lighting
 
 jobs:
   build:
