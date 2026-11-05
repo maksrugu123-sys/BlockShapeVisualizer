@@ -6,6 +6,7 @@ on:
       - main
       - fix/3d-forward-visibility
       - fix/world-native-lighting
+      - fix/render-performance-cache
 
 jobs:
   build:
