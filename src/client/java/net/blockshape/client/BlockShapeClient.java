@@ -31,7 +31,9 @@ import net.minecraft.util.LightCoordsUtil;
 import net.minecraft.util.RandomSource;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.RenderShape;
+import net.minecraft.world.level.block.SnowLayerBlock;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.phys.shapes.CollisionContext;
@@ -50,7 +52,10 @@ import java.io.Writer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Properties;
 
 /** Client-only block collision-shape visualizer for Minecraft 26.3. */
@@ -59,7 +64,10 @@ public final class BlockShapeClient implements ClientModInitializer {
     private static final int MAX_RADIUS = 16;
     private static final int MIN_VERTICAL_RANGE = 0;
     private static final int MAX_VERTICAL_RANGE = 16;
-    private static final int REFRESH_INTERVAL_TICKS = 5;
+    // Rebuild at most twice per second while standing still; movement is handled immediately.
+    private static final int REFRESH_INTERVAL_TICKS = 10;
+    private static final int[] EMPTY_QUAD_INDICES = new int[0];
+    private static final Map<Block, Integer> BLOCK_COLOR_CACHE = new IdentityHashMap<>();
     private static final Path CONFIG_FILE = FabricLoader.getInstance().getConfigDir()
             .resolve("blockshape-visualizer.properties");
     private static final BlockDisplayContext BLOCK_DISPLAY_CONTEXT = BlockDisplayContext.create();
@@ -72,6 +80,7 @@ public final class BlockShapeClient implements ClientModInitializer {
     private static boolean cachedAmbientOcclusion;
 
     private static boolean enabled = true;
+    private static boolean renderOutlines = true;
     private static boolean renderHiddenTextures = true;
     private static int radius = 6;
     private static int downRange = 3;
@@ -80,6 +89,7 @@ public final class BlockShapeClient implements ClientModInitializer {
     private static boolean perBlockColors = true;
     private static int fixedColor = 0xFF35D7FF;
     private static int ticksSinceRefresh = REFRESH_INTERVAL_TICKS;
+    private static BlockPos lastCacheOrigin = BlockPos.ZERO;
     private static List<ShapeEntry> cachedShapes = List.of();
 
     private record ShapeEntry(
@@ -105,7 +115,9 @@ public final class BlockShapeClient implements ClientModInitializer {
                 return;
             }
             boolean ambientOcclusion = client.options.ambientOcclusion().get();
-            if (++ticksSinceRefresh >= REFRESH_INTERVAL_TICKS
+            boolean playerChangedBlock = !client.player.blockPosition().equals(lastCacheOrigin);
+            if (playerChangedBlock
+                    || ++ticksSinceRefresh >= REFRESH_INTERVAL_TICKS
                     || cachedAmbientOcclusion != ambientOcclusion) {
                 ticksSinceRefresh = 0;
                 rebuildCache(client.level, client.player);
@@ -122,30 +134,67 @@ public final class BlockShapeClient implements ClientModInitializer {
         int down = downRange;
         int up = upRange;
         BlockPos origin = player.blockPosition();
+        lastCacheOrigin = origin.immutable();
+        if (!renderOutlines && !renderHiddenTextures) {
+            cachedShapes = List.of();
+            return;
+        }
+
         BlockPos.MutableBlockPos cursor = new BlockPos.MutableBlockPos();
         CollisionContext collisionContext = CollisionContext.of(player);
-        List<ShapeEntry> result = new ArrayList<>();
         int radiusSquared = r * r;
+        int verticalSpan = down + up + 1;
+        int expectedEntries = Math.max(16, (int) (Math.PI * radiusSquared * verticalSpan));
+        List<ShapeEntry> result = new ArrayList<>(expectedEntries);
+        Map<Long, Boolean> chunkAvailability = new HashMap<>();
 
-        // Vertical limits are independent of the horizontal search radius.
-        // Defaults show up to 3 blocks above and 3 blocks below the player.
+        // Check each chunk only once instead of asking Level for every block position.
         for (int y = -down; y <= up; y++) {
             for (int z = -r; z <= r; z++) {
                 for (int x = -r; x <= r; x++) {
                     if (x * x + z * z > radiusSquared) continue;
                     cursor.set(origin.getX() + x, origin.getY() + y, origin.getZ() + z);
-                    if (!level.hasChunkAt(cursor)) continue;
+
+                    long chunkKey = ((long) (cursor.getX() >> 4) << 32)
+                            | ((cursor.getZ() >> 4) & 0xFFFFFFFFL);
+                    Boolean chunkLoaded = chunkAvailability.get(chunkKey);
+                    if (chunkLoaded == null) {
+                        chunkLoaded = level.hasChunkAt(cursor);
+                        chunkAvailability.put(chunkKey, chunkLoaded);
+                    }
+                    if (!chunkLoaded) continue;
 
                     BlockState state = level.getBlockState(cursor);
-                    VoxelShape shape = state.getCollisionShape(level, cursor, collisionContext);
-                    if (shape.isEmpty()) continue;
+                    if (state.isAir()) continue;
 
-                    int color = perBlockColors ? colorForBlock(state) : fixedColor;
                     BlockPos pos = cursor.immutable();
+                    boolean hiddenTextureBlock = renderHiddenTextures
+                            && state.getRenderShape() == RenderShape.INVISIBLE;
+
+                    VoxelShape shape = net.minecraft.world.phys.shapes.Shapes.empty();
+                    if (renderOutlines) {
+                        // Snow's selection shape matches the visible layer height, while its
+                        // collision shape is shorter (and the first layer has no collision).
+                        if (state.getBlock() instanceof SnowLayerBlock) {
+                            shape = state.getShape(level, cursor, collisionContext);
+                        } else {
+                            shape = state.getCollisionShape(level, cursor, collisionContext);
+                            // Non-collidable decorations can still have a useful selection shape.
+                            if (shape.isEmpty()) {
+                                shape = state.getShape(level, cursor, collisionContext);
+                            }
+                        }
+                    }
+
+                    if (shape.isEmpty() && !hiddenTextureBlock) continue;
+
+                    int color = renderOutlines
+                            ? (perBlockColors ? colorForBlock(state) : fixedColor)
+                            : fixedColor;
                     Mesh textureMesh = null;
                     boolean translucentTexture = false;
                     boolean specialTexture = false;
-                    if (renderHiddenTextures && state.getRenderShape() == RenderShape.INVISIBLE) {
+                    if (hiddenTextureBlock) {
                         CachedTexture texture = buildHiddenTextureMesh(level, pos, state);
                         textureMesh = texture.mesh();
                         translucentTexture = texture.translucent();
@@ -162,11 +211,13 @@ public final class BlockShapeClient implements ClientModInitializer {
     }
 
     private static int colorForBlock(BlockState state) {
-        String id = BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
-        int hash = id.hashCode();
-        float hue = Math.floorMod(hash, 360) / 360.0f;
-        int rgb = hsvToRgb(hue, 0.82f, 1.0f);
-        return 0xFF000000 | rgb;
+        return BLOCK_COLOR_CACHE.computeIfAbsent(state.getBlock(), block -> {
+            String id = BuiltInRegistries.BLOCK.getKey(block).toString();
+            int hash = id.hashCode();
+            float hue = Math.floorMod(hash, 360) / 360.0f;
+            int rgb = hsvToRgb(hue, 0.82f, 1.0f);
+            return 0xFF000000 | rgb;
+        });
     }
 
     private static int hsvToRgb(float hue, float saturation, float value) {
@@ -199,6 +250,12 @@ public final class BlockShapeClient implements ClientModInitializer {
         SubmitNodeCollector collector = context.submitNodeCollector();
 
         for (ShapeEntry entry : cachedShapes) {
+            boolean drawHiddenTexture = renderHiddenTextures
+                    && entry.state().getRenderShape() == RenderShape.INVISIBLE
+                    && (entry.hiddenTextureMesh() != null || entry.specialHiddenTexture());
+            boolean drawOutline = renderOutlines && !entry.shape().isEmpty();
+            if (!drawHiddenTexture && !drawOutline) continue;
+
             poseStack.pushPose();
             poseStack.translate(
                     entry.pos().getX() - camera.x,
@@ -209,11 +266,11 @@ public final class BlockShapeClient implements ClientModInitializer {
             // BlockHider marks world blocks INVISIBLE but keeps their baked models
             // and the block texture atlas loaded. Submit those original models here.
             // Normal visible blocks stay on the vanilla path, avoiding z-fighting.
-            if (renderHiddenTextures && entry.state().getRenderShape() == RenderShape.INVISIBLE) {
+            if (drawHiddenTexture) {
                 try {
                     if (entry.hiddenTextureMesh() != null) {
                         submitCachedHiddenBlockTexture(entry, poseStack, collector);
-                    } else if (entry.specialHiddenTexture()) {
+                    } else {
                         submitSpecialHiddenBlockTexture(entry, poseStack, collector);
                     }
                 } catch (RuntimeException ignored) {
@@ -221,14 +278,16 @@ public final class BlockShapeClient implements ClientModInitializer {
                 }
             }
 
-            collector.submitShapeOutline(
-                    poseStack,
-                    entry.shape(),
-                    RenderTypes.lines(),
-                    entry.color(),
-                    lineWidth,
-                    false
-            );
+            if (drawOutline) {
+                collector.submitShapeOutline(
+                        poseStack,
+                        entry.shape(),
+                        RenderTypes.lines(),
+                        entry.color(),
+                        lineWidth,
+                        false
+                );
+            }
             poseStack.popPose();
         }
     }
@@ -317,7 +376,7 @@ public final class BlockShapeClient implements ClientModInitializer {
                 entry.translucentHiddenTexture(),
                 List.of(),
                 entry.hiddenTextureMesh(),
-                new int[0],
+                EMPTY_QUAD_INDICES,
                 0,
                 OverlayTexture.NO_OVERLAY,
                 0
@@ -358,14 +417,18 @@ public final class BlockShapeClient implements ClientModInitializer {
                         .executes(context -> {
                             feedback(context.getSource(), "BlockShape: " + (enabled ? "ON" : "OFF")
                                     + ", radius=" + radius + ", down=" + downRange + ", up=" + upRange + ", width=" + lineWidth
+                                    + ", outlines=" + (renderOutlines ? "ON" : "OFF")
                                     + ", colors=" + (perBlockColors ? "per-block" : "fixed")
                                     + ", hidden textures=" + (renderHiddenTextures ? "ON" : "OFF"));
-                            feedback(context.getSource(), "Commands: /bshape on|off|toggle|textures on|off|radius <2..16>|down <0..16>|up <0..16>|width <1..6>|color rainbow|color RRGGBB");
+                            feedback(context.getSource(), "Commands: /bshape on|off|toggle|outlines on|off|textures on|off|radius <2..16>|down <0..16>|up <0..16>|width <1..6>|color rainbow|color RRGGBB");
                             return 1;
                         })
                         .then(ClientCommands.literal("on").executes(context -> setEnabled(context.getSource(), true)))
                         .then(ClientCommands.literal("off").executes(context -> setEnabled(context.getSource(), false)))
                         .then(ClientCommands.literal("toggle").executes(context -> setEnabled(context.getSource(), !enabled)))
+                        .then(ClientCommands.literal("outlines")
+                                .then(ClientCommands.literal("on").executes(context -> setOutlines(context.getSource(), true)))
+                                .then(ClientCommands.literal("off").executes(context -> setOutlines(context.getSource(), false))))
                         .then(ClientCommands.literal("textures")
                                 .then(ClientCommands.literal("on").executes(context -> setHiddenTextures(context.getSource(), true)))
                                 .then(ClientCommands.literal("off").executes(context -> setHiddenTextures(context.getSource(), false))))
@@ -432,6 +495,14 @@ public final class BlockShapeClient implements ClientModInitializer {
         return 1;
     }
 
+    private static int setOutlines(FabricClientCommandSource source, boolean value) {
+        renderOutlines = value;
+        ticksSinceRefresh = REFRESH_INTERVAL_TICKS;
+        saveConfig();
+        feedback(source, "Block outlines: " + (renderOutlines ? "enabled" : "disabled"));
+        return 1;
+    }
+
     private static int setHiddenTextures(FabricClientCommandSource source, boolean value) {
         renderHiddenTextures = value;
         ticksSinceRefresh = REFRESH_INTERVAL_TICKS;
@@ -450,6 +521,7 @@ public final class BlockShapeClient implements ClientModInitializer {
         try (Reader reader = Files.newBufferedReader(CONFIG_FILE)) {
             properties.load(reader);
             enabled = Boolean.parseBoolean(properties.getProperty("enabled", "true"));
+            renderOutlines = Boolean.parseBoolean(properties.getProperty("renderOutlines", "true"));
             renderHiddenTextures = Boolean.parseBoolean(properties.getProperty("renderHiddenTextures", "true"));
             radius = clamp(parseInt(properties.getProperty("radius"), 6), MIN_RADIUS, MAX_RADIUS);
             downRange = clamp(parseInt(properties.getProperty("downRange"), 3), MIN_VERTICAL_RANGE, MAX_VERTICAL_RANGE);
@@ -466,6 +538,7 @@ public final class BlockShapeClient implements ClientModInitializer {
     private static void saveConfig() {
         Properties properties = new Properties();
         properties.setProperty("enabled", Boolean.toString(enabled));
+        properties.setProperty("renderOutlines", Boolean.toString(renderOutlines));
         properties.setProperty("renderHiddenTextures", Boolean.toString(renderHiddenTextures));
         properties.setProperty("radius", Integer.toString(radius));
         properties.setProperty("downRange", Integer.toString(downRange));
