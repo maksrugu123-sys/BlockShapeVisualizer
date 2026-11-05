@@ -8,6 +8,7 @@ on:
       - fix/world-native-lighting
       - fix/render-performance-cache
       - feat/outlines-snow-performance
+      - feat/static-fluids-portals
 
 jobs:
   build:
