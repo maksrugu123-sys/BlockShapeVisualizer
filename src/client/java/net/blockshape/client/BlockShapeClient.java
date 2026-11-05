@@ -69,6 +69,7 @@ public final class BlockShapeClient implements ClientModInitializer {
     private static AltModelBlockRenderer hiddenTextureRenderer;
     private static boolean hiddenTextureRendererAmbientOcclusion;
     private static boolean hiddenTextureRendererInitialized;
+    private static boolean cachedAmbientOcclusion;
 
     private static boolean enabled = true;
     private static boolean renderHiddenTextures = true;
@@ -81,7 +82,17 @@ public final class BlockShapeClient implements ClientModInitializer {
     private static int ticksSinceRefresh = REFRESH_INTERVAL_TICKS;
     private static List<ShapeEntry> cachedShapes = List.of();
 
-    private record ShapeEntry(BlockPos pos, BlockState state, VoxelShape shape, int color) {}
+    private record ShapeEntry(
+            BlockPos pos,
+            BlockState state,
+            VoxelShape shape,
+            int color,
+            Mesh hiddenTextureMesh,
+            boolean translucentHiddenTexture,
+            boolean specialHiddenTexture
+    ) {}
+
+    private record CachedTexture(Mesh mesh, boolean translucent, boolean specialModel) {}
 
     @Override
     public void onInitializeClient() {
@@ -93,7 +104,9 @@ public final class BlockShapeClient implements ClientModInitializer {
                 ticksSinceRefresh = REFRESH_INTERVAL_TICKS;
                 return;
             }
-            if (++ticksSinceRefresh >= REFRESH_INTERVAL_TICKS) {
+            boolean ambientOcclusion = client.options.ambientOcclusion().get();
+            if (++ticksSinceRefresh >= REFRESH_INTERVAL_TICKS
+                    || cachedAmbientOcclusion != ambientOcclusion) {
                 ticksSinceRefresh = 0;
                 rebuildCache(client.level, client.player);
             }
@@ -103,7 +116,8 @@ public final class BlockShapeClient implements ClientModInitializer {
         registerCommands();
     }
 
-    private static void rebuildCache(Level level, Player player) {
+    private static void rebuildCache(ClientLevel level, Player player) {
+        cachedAmbientOcclusion = Minecraft.getInstance().options.ambientOcclusion().get();
         int r = radius;
         int down = downRange;
         int up = upRange;
@@ -127,7 +141,20 @@ public final class BlockShapeClient implements ClientModInitializer {
                     if (shape.isEmpty()) continue;
 
                     int color = perBlockColors ? colorForBlock(state) : fixedColor;
-                    result.add(new ShapeEntry(cursor.immutable(), state, shape, color));
+                    BlockPos pos = cursor.immutable();
+                    Mesh textureMesh = null;
+                    boolean translucentTexture = false;
+                    boolean specialTexture = false;
+                    if (renderHiddenTextures && state.getRenderShape() == RenderShape.INVISIBLE) {
+                        CachedTexture texture = buildHiddenTextureMesh(level, pos, state);
+                        textureMesh = texture.mesh();
+                        translucentTexture = texture.translucent();
+                        specialTexture = texture.specialModel();
+                    }
+                    result.add(new ShapeEntry(
+                            pos, state, shape, color,
+                            textureMesh, translucentTexture, specialTexture
+                    ));
                 }
             }
         }
@@ -184,7 +211,11 @@ public final class BlockShapeClient implements ClientModInitializer {
             // Normal visible blocks stay on the vanilla path, avoiding z-fighting.
             if (renderHiddenTextures && entry.state().getRenderShape() == RenderShape.INVISIBLE) {
                 try {
-                    submitHiddenBlockTexture(entry, poseStack, collector);
+                    if (entry.hiddenTextureMesh() != null) {
+                        submitCachedHiddenBlockTexture(entry, poseStack, collector);
+                    } else if (entry.specialHiddenTexture()) {
+                        submitSpecialHiddenBlockTexture(entry, poseStack, collector);
+                    }
                 } catch (RuntimeException ignored) {
                     // An unsupported third-party model must not break the whole world render.
                 }
@@ -203,19 +234,16 @@ public final class BlockShapeClient implements ClientModInitializer {
     }
 
     /**
-     * Rebuilds a hidden block's model through Fabric's world renderer. This keeps
-     * vanilla-style AO, per-vertex sky/block light, biome tinting, model offsets,
-     * and neighbor-face culling instead of treating the block as an inventory item.
+     * Builds each hidden block's immutable world mesh only when the nearby-block
+     * cache is refreshed. Reusing that mesh between frames avoids rebuilding
+     * hundreds of block models on every render frame.
      */
-    private static void submitHiddenBlockTexture(
-            ShapeEntry entry,
-            PoseStack poseStack,
-            SubmitNodeCollector collector
+    private static CachedTexture buildHiddenTextureMesh(
+            ClientLevel clientLevel,
+            BlockPos pos,
+            BlockState state
     ) {
         Minecraft minecraft = Minecraft.getInstance();
-        ClientLevel clientLevel = minecraft.level;
-        if (clientLevel == null) return;
-
         boolean ambientOcclusion = minecraft.options.ambientOcclusion().get();
         Renderer renderer = Renderer.get();
 
@@ -234,65 +262,91 @@ public final class BlockShapeClient implements ClientModInitializer {
         }
 
         BlockModel displayModel = minecraft.getModelManager()
-                .getBlockModelSet().get(entry.state());
-        long seed = entry.state().getSeed(entry.pos());
+                .getBlockModelSet().get(state);
 
-        // Built-in special models (chests, heads, bells, portals, flower beds, etc.)
-        // need their vanilla display wrapper and special renderer. Keep that path
-        // intact; ordinary BlockStateModelWrapper instances use the world renderer below.
+        // Keep vanilla's special display path for chests, heads, bells, portals, etc.
         if (!(displayModel instanceof BlockStateModelWrapper)) {
-            SPECIAL_MODEL_RENDER_STATE.clear();
-            displayModel.update(
-                    SPECIAL_MODEL_RENDER_STATE,
-                    entry.state(),
-                    BLOCK_DISPLAY_CONTEXT,
-                    seed
-            );
-            SPECIAL_MODEL_RENDER_STATE.submit(
-                    poseStack,
-                    collector,
-                    LightCoordsUtil.getLightCoords(clientLevel, entry.pos()),
-                    OverlayTexture.NO_OVERLAY,
-                    0
-            );
-            return;
+            return new CachedTexture(null, false, true);
         }
 
         BlockStateModel model = minecraft.getModelManager()
-                .getBlockStateModelSet().get(entry.state());
+                .getBlockStateModelSet().get(state);
         BlockAndTintGetter blockView = clientLevel;
-
+        long seed = state.getSeed(pos);
         boolean translucent = ((FabricBlockStateModel) model).hasMaterialFlag(
                 blockView,
-                entry.pos(),
-                entry.state(),
+                pos,
+                state,
                 RandomSource.createThreadLocalInstance(seed),
                 BakedQuad.FLAG_TRANSLUCENT
         );
 
-        hiddenTextureRenderer.tesselateBlock(
-                hiddenTextureMesh.emitter(),
-                0.0f,
-                0.0f,
-                0.0f,
-                blockView,
-                entry.pos(),
-                entry.state(),
-                model,
-                seed
-        );
+        // immutableCopy() preserves its source mesh. Clear it before and after
+        // each block so geometry can never accumulate between blocks or frames.
+        hiddenTextureMesh.clear();
+        try {
+            hiddenTextureRenderer.tesselateBlock(
+                    hiddenTextureMesh.emitter(),
+                    0.0f,
+                    0.0f,
+                    0.0f,
+                    blockView,
+                    pos,
+                    state,
+                    model,
+                    seed
+            );
 
-        if (hiddenTextureMesh.size() == 0) return;
+            if (hiddenTextureMesh.size() == 0) {
+                return new CachedTexture(null, false, false);
+            }
+            return new CachedTexture(hiddenTextureMesh.immutableCopy(), translucent, false);
+        } finally {
+            hiddenTextureMesh.clear();
+        }
+    }
 
-        Mesh immutableMesh = hiddenTextureMesh.immutableCopy();
+    private static void submitCachedHiddenBlockTexture(
+            ShapeEntry entry,
+            PoseStack poseStack,
+            SubmitNodeCollector collector
+    ) {
         ((FabricOrderedSubmitNodeCollector) collector).submitBlockModel(
                 poseStack,
                 ChunkSectionLayerHelper::getMovingBlockRenderType,
-                translucent,
+                entry.translucentHiddenTexture(),
                 List.of(),
-                immutableMesh,
+                entry.hiddenTextureMesh(),
                 new int[0],
                 0,
+                OverlayTexture.NO_OVERLAY,
+                0
+        );
+    }
+
+    /** Special baked models retain the normal vanilla display-state submission path. */
+    private static void submitSpecialHiddenBlockTexture(
+            ShapeEntry entry,
+            PoseStack poseStack,
+            SubmitNodeCollector collector
+    ) {
+        Minecraft minecraft = Minecraft.getInstance();
+        ClientLevel clientLevel = minecraft.level;
+        if (clientLevel == null) return;
+
+        BlockModel displayModel = minecraft.getModelManager()
+                .getBlockModelSet().get(entry.state());
+        SPECIAL_MODEL_RENDER_STATE.clear();
+        displayModel.update(
+                SPECIAL_MODEL_RENDER_STATE,
+                entry.state(),
+                BLOCK_DISPLAY_CONTEXT,
+                entry.state().getSeed(entry.pos())
+        );
+        SPECIAL_MODEL_RENDER_STATE.submit(
+                poseStack,
+                collector,
+                LightCoordsUtil.getLightCoords(clientLevel, entry.pos()),
                 OverlayTexture.NO_OVERLAY,
                 0
         );
@@ -380,6 +434,7 @@ public final class BlockShapeClient implements ClientModInitializer {
 
     private static int setHiddenTextures(FabricClientCommandSource source, boolean value) {
         renderHiddenTextures = value;
+        ticksSinceRefresh = REFRESH_INTERVAL_TICKS;
         saveConfig();
         feedback(source, "Hidden block textures: " + (renderHiddenTextures ? "enabled" : "disabled"));
         return 1;
