@@ -16,13 +16,18 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.renderer.SubmitNodeCollector;
 import net.minecraft.client.renderer.block.BlockAndTintGetter;
+import net.minecraft.client.renderer.block.BlockModelRenderState;
 import net.minecraft.client.renderer.block.dispatch.BlockStateModel;
+import net.minecraft.client.renderer.block.model.BlockDisplayContext;
+import net.minecraft.client.renderer.block.model.BlockModel;
+import net.minecraft.client.renderer.block.model.BlockStateModelWrapper;
 import net.minecraft.client.renderer.rendertype.RenderTypes;
 import net.minecraft.client.renderer.texture.OverlayTexture;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.chat.Component;
 import net.minecraft.client.resources.model.geometry.BakedQuad;
+import net.minecraft.util.LightCoordsUtil;
 import net.minecraft.util.RandomSource;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.level.Level;
@@ -57,6 +62,8 @@ public final class BlockShapeClient implements ClientModInitializer {
     private static final int REFRESH_INTERVAL_TICKS = 5;
     private static final Path CONFIG_FILE = FabricLoader.getInstance().getConfigDir()
             .resolve("blockshape-visualizer.properties");
+    private static final BlockDisplayContext BLOCK_DISPLAY_CONTEXT = BlockDisplayContext.create();
+    private static final BlockModelRenderState SPECIAL_MODEL_RENDER_STATE = new BlockModelRenderState();
 
     private static MutableMesh hiddenTextureMesh;
     private static AltModelBlockRenderer hiddenTextureRenderer;
@@ -226,10 +233,34 @@ public final class BlockShapeClient implements ClientModInitializer {
             hiddenTextureRendererInitialized = true;
         }
 
+        BlockModel displayModel = minecraft.getModelManager()
+                .getBlockModelSet().get(entry.state());
+        long seed = entry.state().getSeed(entry.pos());
+
+        // Built-in special models (chests, heads, bells, portals, flower beds, etc.)
+        // need their vanilla display wrapper and special renderer. Keep that path
+        // intact; ordinary BlockStateModelWrapper instances use the world renderer below.
+        if (!(displayModel instanceof BlockStateModelWrapper)) {
+            SPECIAL_MODEL_RENDER_STATE.clear();
+            displayModel.update(
+                    SPECIAL_MODEL_RENDER_STATE,
+                    entry.state(),
+                    BLOCK_DISPLAY_CONTEXT,
+                    seed
+            );
+            SPECIAL_MODEL_RENDER_STATE.submit(
+                    poseStack,
+                    collector,
+                    LightCoordsUtil.getLightCoords(clientLevel, entry.pos()),
+                    OverlayTexture.NO_OVERLAY,
+                    0
+            );
+            return;
+        }
+
         BlockStateModel model = minecraft.getModelManager()
                 .getBlockStateModelSet().get(entry.state());
         BlockAndTintGetter blockView = clientLevel;
-        long seed = entry.state().getSeed(entry.pos());
 
         boolean translucent = ((FabricBlockStateModel) model).hasMaterialFlag(
                 blockView,
