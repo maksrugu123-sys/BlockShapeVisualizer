@@ -8,6 +8,12 @@
   "entrypoints": {
     "client": ["net.blockshape.client.BlockShapeClient"]
   },
+  "mixins": [
+    {
+      "config": "blockshape.client.mixins.json",
+      "environment": "client"
+    }
+  ],
   "depends": {
     "fabricloader": ">=0.20.1",
     "minecraft": "26.3",
