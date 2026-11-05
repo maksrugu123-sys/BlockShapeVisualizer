@@ -1,0 +1,13 @@
+{
+  "required": true,
+  "package": "net.blockshape.client.mixin",
+  "compatibilityLevel": "JAVA_25",
+  "refmap": "blockshape.refmap.json",
+  "client": [
+    "SpriteContentsMixin",
+    "AbstractEndPortalRendererMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
