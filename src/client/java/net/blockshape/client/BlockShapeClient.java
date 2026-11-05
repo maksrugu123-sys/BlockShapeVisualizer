@@ -13,16 +13,19 @@ import net.fabricmc.fabric.api.client.rendering.v1.level.LevelRenderEvents;
 import net.fabricmc.fabric.api.client.rendering.v1.level.LevelRenderContext;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.renderer.SubmitNodeCollector;
-import net.minecraft.client.renderer.block.BlockModelRenderState;
-import net.minecraft.client.renderer.block.model.BlockDisplayContext;
-import net.minecraft.client.renderer.block.model.BlockModel;
+import net.minecraft.client.renderer.block.BlockAndTintGetter;
+import net.minecraft.client.renderer.block.dispatch.BlockStateModel;
+import net.minecraft.client.renderer.chunk.ChunkSectionLayer;
+import net.minecraft.client.renderer.rendertype.RenderType;
 import net.minecraft.client.renderer.rendertype.RenderTypes;
 import net.minecraft.client.renderer.texture.OverlayTexture;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.chat.Component;
-import net.minecraft.util.LightCoordsUtil;
+import net.minecraft.client.resources.model.geometry.BakedQuad;
+import net.minecraft.util.RandomSource;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.RenderShape;
@@ -30,6 +33,13 @@ import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.phys.shapes.CollisionContext;
 import net.minecraft.world.phys.shapes.VoxelShape;
+import net.fabricmc.fabric.api.client.renderer.v1.Renderer;
+import net.fabricmc.fabric.api.client.renderer.v1.mesh.Mesh;
+import net.fabricmc.fabric.api.client.renderer.v1.mesh.MutableMesh;
+import net.fabricmc.fabric.api.client.renderer.v1.model.FabricBlockStateModel;
+import net.fabricmc.fabric.api.client.renderer.v1.render.AltModelBlockRenderer;
+import net.fabricmc.fabric.api.client.renderer.v1.render.ChunkSectionLayerHelper;
+import net.fabricmc.fabric.api.client.renderer.v1.render.FabricOrderedSubmitNodeCollector;
 
 import java.io.IOException;
 import java.io.Reader;
@@ -49,7 +59,11 @@ public final class BlockShapeClient implements ClientModInitializer {
     private static final int REFRESH_INTERVAL_TICKS = 5;
     private static final Path CONFIG_FILE = FabricLoader.getInstance().getConfigDir()
             .resolve("blockshape-visualizer.properties");
-    private static final BlockDisplayContext BLOCK_DISPLAY_CONTEXT = BlockDisplayContext.create();
+
+    private static MutableMesh hiddenTextureMesh;
+    private static AltModelBlockRenderer hiddenTextureRenderer;
+    private static boolean hiddenTextureRendererAmbientOcclusion;
+    private static boolean hiddenTextureRendererInitialized;
 
     private static boolean enabled = true;
     private static boolean renderHiddenTextures = true;
@@ -151,7 +165,6 @@ public final class BlockShapeClient implements ClientModInitializer {
         Vec3 camera = context.levelState().cameraRenderState.pos;
         PoseStack poseStack = context.poseStack();
         SubmitNodeCollector collector = context.submitNodeCollector();
-        BlockModelRenderState modelRenderState = new BlockModelRenderState();
 
         for (ShapeEntry entry : cachedShapes) {
             poseStack.pushPose();
@@ -166,22 +179,7 @@ public final class BlockShapeClient implements ClientModInitializer {
             // Normal visible blocks stay on the vanilla path, avoiding z-fighting.
             if (renderHiddenTextures && entry.state().getRenderShape() == RenderShape.INVISIBLE) {
                 try {
-                    modelRenderState.clear();
-                    BlockModel model = Minecraft.getInstance().getModelManager()
-                            .getBlockModelSet().get(entry.state());
-                    model.update(
-                            modelRenderState,
-                            entry.state(),
-                            BLOCK_DISPLAY_CONTEXT,
-                            entry.state().getSeed(entry.pos())
-                    );
-                    modelRenderState.submit(
-                            poseStack,
-                            collector,
-                            LightCoordsUtil.getLightCoords(level, entry.pos()),
-                            OverlayTexture.NO_OVERLAY,
-                            0
-                    );
+                    submitHiddenBlockTexture(level, entry, poseStack, collector);
                 } catch (RuntimeException ignored) {
                     // An unsupported third-party model must not break the whole world render.
                 }
@@ -197,6 +195,79 @@ public final class BlockShapeClient implements ClientModInitializer {
             );
             poseStack.popPose();
         }
+    }
+
+    /**
+     * Rebuilds a hidden block's model through Fabric's world renderer. This keeps
+     * vanilla-style AO, per-vertex sky/block light, biome tinting, model offsets,
+     * and neighbor-face culling instead of treating the block as an inventory item.
+     */
+    private static void submitHiddenBlockTexture(
+            Level level,
+            ShapeEntry entry,
+            PoseStack poseStack,
+            SubmitNodeCollector collector
+    ) {
+        Minecraft minecraft = Minecraft.getInstance();
+        ClientLevel clientLevel = minecraft.level;
+        if (clientLevel == null) return;
+
+        boolean ambientOcclusion = minecraft.options.ambientOcclusion().get();
+        Renderer renderer = Renderer.get();
+
+        if (hiddenTextureMesh == null) {
+            hiddenTextureMesh = renderer.mutableMesh();
+        }
+        if (!hiddenTextureRendererInitialized
+                || hiddenTextureRendererAmbientOcclusion != ambientOcclusion) {
+            hiddenTextureRenderer = renderer.altModelBlockRenderer(
+                    ambientOcclusion,
+                    true,
+                    minecraft.getBlockColors()
+            );
+            hiddenTextureRendererAmbientOcclusion = ambientOcclusion;
+            hiddenTextureRendererInitialized = true;
+        }
+
+        BlockStateModel model = minecraft.getModelManager()
+                .getBlockStateModelSet().get(entry.state());
+        BlockAndTintGetter blockView = clientLevel;
+        long seed = entry.state().getSeed(entry.pos());
+
+        boolean translucent = ((FabricBlockStateModel) model).hasMaterialFlag(
+                blockView,
+                entry.pos(),
+                entry.state(),
+                RandomSource.createThreadLocalInstance(seed),
+                BakedQuad.FLAG_TRANSLUCENT
+        );
+
+        hiddenTextureRenderer.tesselateBlock(
+                hiddenTextureMesh.emitter(),
+                0.0f,
+                0.0f,
+                0.0f,
+                blockView,
+                entry.pos(),
+                entry.state(),
+                model,
+                seed
+        );
+
+        if (hiddenTextureMesh.size() == 0) return;
+
+        Mesh immutableMesh = hiddenTextureMesh.immutableCopy();
+        ((FabricOrderedSubmitNodeCollector) collector).submitBlockModel(
+                poseStack,
+                ChunkSectionLayerHelper::getMovingBlockRenderType,
+                translucent,
+                List.of(),
+                immutableMesh,
+                new int[0],
+                0,
+                OverlayTexture.NO_OVERLAY,
+                0
+        );
     }
 
     private static void registerCommands() {
