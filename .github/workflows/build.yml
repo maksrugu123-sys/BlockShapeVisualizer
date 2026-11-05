@@ -7,6 +7,7 @@ on:
       - fix/3d-forward-visibility
       - fix/world-native-lighting
       - fix/render-performance-cache
+      - feat/outlines-snow-performance
 
 jobs:
   build:
