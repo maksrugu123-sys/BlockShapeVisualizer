@@ -17,8 +17,6 @@ import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.renderer.SubmitNodeCollector;
 import net.minecraft.client.renderer.block.BlockAndTintGetter;
 import net.minecraft.client.renderer.block.dispatch.BlockStateModel;
-import net.minecraft.client.renderer.chunk.ChunkSectionLayer;
-import net.minecraft.client.renderer.rendertype.RenderType;
 import net.minecraft.client.renderer.rendertype.RenderTypes;
 import net.minecraft.client.renderer.texture.OverlayTexture;
 import net.minecraft.core.BlockPos;
@@ -179,7 +177,7 @@ public final class BlockShapeClient implements ClientModInitializer {
             // Normal visible blocks stay on the vanilla path, avoiding z-fighting.
             if (renderHiddenTextures && entry.state().getRenderShape() == RenderShape.INVISIBLE) {
                 try {
-                    submitHiddenBlockTexture(level, entry, poseStack, collector);
+                    submitHiddenBlockTexture(entry, poseStack, collector);
                 } catch (RuntimeException ignored) {
                     // An unsupported third-party model must not break the whole world render.
                 }
@@ -203,7 +201,6 @@ public final class BlockShapeClient implements ClientModInitializer {
      * and neighbor-face culling instead of treating the block as an inventory item.
      */
     private static void submitHiddenBlockTexture(
-            Level level,
             ShapeEntry entry,
             PoseStack poseStack,
             SubmitNodeCollector collector
