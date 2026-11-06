@@ -279,6 +279,8 @@ public final class BlockShapeClient implements ClientModInitializer {
     private static boolean shouldRestoreHiddenTextureCategory(BlockState state) {
         String blockId = BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
         if (DISABLED_TEXTURE_BLOCK_IDS.contains(blockId)) return false;
+        // Keep liquid blocks under their own switch; waterlogged solid blocks are not LiquidBlock instances.
+        if (state.getBlock() instanceof net.minecraft.world.level.block.LiquidBlock) return categoryLiquids;
         if (state.is(BlockTags.PORTALS) || state.is(Blocks.END_GATEWAY)) return categoryPortals;
         if (state.is(BlockTags.FIRE) || state.is(BlockTags.CAMPFIRES)) return categoryFire;
         if (isPlantBlock(state)) return categoryPlants;
