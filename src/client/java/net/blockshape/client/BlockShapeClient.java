@@ -94,6 +94,8 @@ public final class BlockShapeClient implements ClientModInitializer {
     private static int refreshIntervalTicks = DEFAULT_REFRESH_INTERVAL_TICKS;
     private static int scanBudgetPerTick = 4096;
     private static int textureBuildBudgetPerTick = 24;
+    private static final long CACHE_SLICE_TARGET_NANOS = 2_500_000L;
+    private static double adaptiveBudgetScale = 1.0;
     private static final int[] EMPTY_QUAD_INDICES = new int[0];
     private static final Logger LOGGER = LoggerFactory.getLogger("blockshape");
     private static final int MAX_LOGGED_RENDER_ERRORS = 128;
@@ -323,8 +325,8 @@ public final class BlockShapeClient implements ClientModInitializer {
         if (job == null) return;
 
         long passStarted = System.nanoTime();
-        int positionsRemaining = scanBudgetPerTick;
-        int textureBuildsRemaining = textureBuildBudgetPerTick;
+        int positionsRemaining = Math.max(256, (int) (scanBudgetPerTick * adaptiveBudgetScale));
+        int textureBuildsRemaining = Math.max(1, (int) (textureBuildBudgetPerTick * adaptiveBudgetScale));
 
         while (positionsRemaining > 0 && !job.complete) {
             int x = job.x;
@@ -421,7 +423,14 @@ public final class BlockShapeClient implements ClientModInitializer {
             advanceCacheBuildPosition(job);
         }
 
-        job.cpuNanos += System.nanoTime() - passStarted;
+        long passNanos = System.nanoTime() - passStarted;
+        job.cpuNanos += passNanos;
+        // Keep each client-tick slice small on slower devices; recover gradually when headroom returns.
+        if (passNanos > CACHE_SLICE_TARGET_NANOS) {
+            adaptiveBudgetScale = Math.max(0.15, adaptiveBudgetScale * 0.75);
+        } else if (passNanos < CACHE_SLICE_TARGET_NANOS / 2) {
+            adaptiveBudgetScale = Math.min(1.0, adaptiveBudgetScale + 0.05);
+        }
         if (job.complete) {
             ArrayList<ShapeEntry> previousBuffer = cachedShapes;
             cachedShapes = cacheBuildEntries;
@@ -950,6 +959,7 @@ public final class BlockShapeClient implements ClientModInitializer {
                                     + ", reused=" + lastReusedEntries + ", rebuilt=" + lastRebuiltEntries
                                     + ", scanned=" + lastScannedPositions
                                     + ", cache CPU time=" + Math.round(lastRebuildMillis * 100.0) / 100.0 + " ms"
+                                    + ", adaptive work=" + Math.round(adaptiveBudgetScale * 100.0) + "%"
                                     + ", unique render errors=" + LOGGED_RENDER_ERRORS.size());
                             feedback(context.getSource(), "Commands: /bshape on|off|toggle|inspect|refresh|reload|reset|block <namespace:id> <on|off>|namespace <name> <on|off>|quality performance|low|balanced|high|category <liquids|portals|fire|plants|special> <on|off>|outlines on|off|textures on|off|radius <2..32>|texture-radius <1..32|auto>|down <0..16>|up <0..16>|width <1..6>|color rainbow|color RRGGBB");
                             return 1;
@@ -1140,6 +1150,7 @@ public final class BlockShapeClient implements ClientModInitializer {
     private static int setQuality(FabricClientCommandSource source, String preset) {
         qualityPreset = preset;
         applyQualityPreset(preset);
+        adaptiveBudgetScale = 1.0;
         invalidateCache();
         saveConfig();
         feedback(source, "Quality preset: " + preset + " (radius=" + radius
