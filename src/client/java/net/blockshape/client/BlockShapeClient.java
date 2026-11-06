@@ -756,7 +756,9 @@ public final class BlockShapeClient implements ClientModInitializer {
         }
 
         String category = textureCategoryName(state, specialModel);
-        boolean restorationEnabled = renderHiddenTextures && shouldRestoreHiddenTextureCategory(state);
+        boolean restorationEnabled = renderHiddenTextures
+                && shouldRestoreHiddenTextureCategory(state)
+                && (!specialModel || categorySpecialModels);
         ShapeEntry cached = cachedShapes.stream()
                 .filter(entry -> entry.pos().equals(pos))
                 .findFirst()
@@ -766,7 +768,8 @@ public final class BlockShapeClient implements ClientModInitializer {
                 : cached.specialHiddenTexture() ? "special fallback"
                 : "shape only";
 
-        source.sendFeedback(Component.literal("[BlockShape] " + blockId + " at " + pos.toShortString()));
+        String coordinates = pos.getX() + ", " + pos.getY() + ", " + pos.getZ();
+        source.sendFeedback(Component.literal("[BlockShape] " + blockId + " at " + coordinates));
         source.sendFeedback(Component.literal("[BlockShape] Category: " + category
                 + " | RenderShape: " + state.getRenderShape() + " | Model: " + modelType));
         source.sendFeedback(Component.literal("[BlockShape] Texture restore: "
