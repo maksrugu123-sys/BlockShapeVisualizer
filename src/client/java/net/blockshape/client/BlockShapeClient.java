@@ -289,6 +289,32 @@ public final class BlockShapeClient implements ClientModInitializer {
         ticksSinceRefresh = refreshIntervalTicks;
     }
 
+    /**
+     * Invalidate the changed block and its surrounding 3x3x3 neighborhood.
+     * Neighboring model meshes may use face culling or connected-model data
+     * derived from the changed position. The normal refresh interval is bypassed
+     * once so the nearby cache is rebuilt on the next client tick.
+     */
+    public static void invalidateBlockAndNeighbors(BlockPos changedPos) {
+        if (!cachedShapes.isEmpty()) {
+            int minX = changedPos.getX() - 1;
+            int maxX = changedPos.getX() + 1;
+            int minY = changedPos.getY() - 1;
+            int maxY = changedPos.getY() + 1;
+            int minZ = changedPos.getZ() - 1;
+            int maxZ = changedPos.getZ() + 1;
+            cachedShapes = cachedShapes.stream()
+                    .filter(entry -> {
+                        BlockPos pos = entry.pos();
+                        return pos.getX() < minX || pos.getX() > maxX
+                                || pos.getY() < minY || pos.getY() > maxY
+                                || pos.getZ() < minZ || pos.getZ() > maxZ;
+                    })
+                    .toList();
+        }
+        ticksSinceRefresh = refreshIntervalTicks;
+    }
+
     private static void invalidateChunkCache(net.minecraft.world.level.chunk.LevelChunk chunk) {
         int minX = chunk.getPos().getMinBlockX();
         int minZ = chunk.getPos().getMinBlockZ();
