@@ -616,7 +616,7 @@ public final class BlockShapeClient implements ClientModInitializer {
                                     + ", hidden textures=" + (renderHiddenTextures ? "ON" : "OFF"));
                             feedback(context.getSource(), "Категории L/P/F/G/M = жидкости/порталы/огонь/растения/спецмодели; ON означает обработку категории.");
                             feedback(context.getSource(), "Cached entries=" + cachedShapes.size() + ", unique render errors=" + LOGGED_RENDER_ERRORS.size());
-                            feedback(context.getSource(), "Commands: /bshape on|off|toggle|inspect|refresh|reset|block <namespace:id> <on|off>|namespace <name> <on|off>|quality low|balanced|high|category <liquids|portals|fire|plants|special> <on|off>|outlines on|off|textures on|off|radius <2..16>|down <0..16>|up <0..16>|width <1..6>|color rainbow|color RRGGBB");
+                            feedback(context.getSource(), "Commands: /bshape on|off|toggle|inspect|refresh|reload|reset|block <namespace:id> <on|off>|namespace <name> <on|off>|quality low|balanced|high|category <liquids|portals|fire|plants|special> <on|off>|outlines on|off|textures on|off|radius <2..16>|down <0..16>|up <0..16>|width <1..6>|color rainbow|color RRGGBB");
                             return 1;
                         })
                         .then(ClientCommands.literal("on").executes(context -> setEnabled(context.getSource(), true)))
@@ -626,6 +626,15 @@ public final class BlockShapeClient implements ClientModInitializer {
                         .then(ClientCommands.literal("refresh").executes(context -> {
                             invalidateCache();
                             feedback(context.getSource(), "Nearby block and texture cache will be rebuilt now");
+                            return 1;
+                        }))
+                        .then(ClientCommands.literal("reload").executes(context -> {
+                            feedback(context.getSource(), "Starting Minecraft resource-pack reload. The game may pause briefly.");
+                            Minecraft.getInstance().reloadResourcePacks().whenComplete((ignored, error) -> {
+                                if (error != null) {
+                                    LOGGER.error("Resource-pack reload failed while applying BlockShape category settings.", error);
+                                }
+                            });
                             return 1;
                         }))
                         .then(ClientCommands.literal("reset").executes(context -> resetSettings(context.getSource())))
