@@ -179,7 +179,7 @@ public final class BlockShapeClient implements ClientModInitializer {
     private static double lastRenderPreparationMillis;
     private static double lastOutlineBatchMillis;
     private static final Set<Long> pendingLightSections = new HashSet<>();
-    private static final ArrayList<ShapeEntry> outlineSubmitEntries = new ArrayList<>();
+    private static ArrayList<ShapeEntry> outlineSubmitEntries = new ArrayList<>();
 
     private record NeighborSnapshot(BlockState state, int packedLight) {}
 
@@ -301,7 +301,7 @@ public final class BlockShapeClient implements ClientModInitializer {
                 cacheBuildEntries = releaseCacheBuffer(cacheBuildEntries);
                 cachedChunkBuckets.clear();
                 pendingLightSections.clear();
-                outlineSubmitEntries.clear();
+                outlineSubmitEntries = releaseCacheBuffer(outlineSubmitEntries);
                 lastReusedEntries = 0;
                 lastRebuiltEntries = 0;
                 lastScannedPositions = 0;
@@ -579,7 +579,7 @@ public final class BlockShapeClient implements ClientModInitializer {
             maxSliceNanos = Math.max(maxSliceNanos, lastSliceNanos);
             cacheBuildJob = null;
             rebuildChunkBuckets();
-            previousByPosition.clear();
+            releasePreviousIndex();
             chunkAvailability.clear();
             nonEmptySectionCache.clear();
         }
@@ -611,7 +611,7 @@ public final class BlockShapeClient implements ClientModInitializer {
         buildDirtyPositions.clear();
         buildShapeDirtyPositions.clear();
         buildFullShapeRefresh = false;
-        previousByPosition.clear();
+        releasePreviousIndex();
         chunkAvailability.clear();
         nonEmptySectionCache.clear();
     }
@@ -723,12 +723,20 @@ public final class BlockShapeClient implements ClientModInitializer {
         return buffer;
     }
 
+    private static void releasePreviousIndex() {
+        if (previousByPosition.size() > MAX_RETAINED_CACHE_ENTRIES) {
+            previousByPosition = new HashMap<>();
+        } else {
+            previousByPosition.clear();
+        }
+    }
+
     private static void invalidateCache() {
         cancelCacheBuild();
         cachedShapes = releaseCacheBuffer(cachedShapes);
         cachedChunkBuckets.clear();
         pendingLightSections.clear();
-        outlineSubmitEntries.clear();
+        outlineSubmitEntries = releaseCacheBuffer(outlineSubmitEntries);
         lastReusedEntries = 0;
         lastRebuiltEntries = 0;
         lastScannedPositions = 0;
