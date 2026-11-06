@@ -1,5 +1,6 @@
 package net.blockshape.client.mixin;
 
+import net.blockshape.client.BlockShapeClient;
 import net.minecraft.client.renderer.blockentity.AbstractEndPortalRenderer;
 import net.minecraft.client.renderer.rendertype.RenderType;
 import net.minecraft.client.renderer.rendertype.RenderTypes;
@@ -21,6 +22,7 @@ public abstract class AbstractEndPortalRendererMixin {
             require = 0
     )
     private static RenderType blockshape$useStaticEndTexture(RenderType original) {
+        if (!BlockShapeClient.isPortalCategoryEnabled()) return original;
         return RenderTypes.entityTranslucent(AbstractEndPortalRenderer.END_SKY_LOCATION);
     }
 }

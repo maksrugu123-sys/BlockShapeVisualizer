@@ -26,6 +26,7 @@ import net.minecraft.client.renderer.rendertype.RenderTypes;
 import net.minecraft.client.renderer.texture.OverlayTexture;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.tags.BlockTags;
 import net.minecraft.network.chat.Component;
 import net.minecraft.client.resources.model.geometry.BakedQuad;
 import net.minecraft.util.LightCoordsUtil;
@@ -33,6 +34,8 @@ import net.minecraft.util.RandomSource;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.BushBlock;
 import net.minecraft.world.level.block.RenderShape;
 import net.minecraft.world.level.block.SnowLayerBlock;
 import net.minecraft.world.level.block.state.BlockState;
@@ -92,6 +95,11 @@ public final class BlockShapeClient implements ClientModInitializer {
     private static boolean enabled = true;
     private static boolean renderOutlines = true;
     private static boolean renderHiddenTextures = true;
+    private static boolean categoryLiquids = true;
+    private static boolean categoryPortals = true;
+    private static boolean categoryFire = true;
+    private static boolean categoryPlants = true;
+    private static boolean categorySpecialModels = true;
     private static int radius = 6;
     private static int downRange = 3;
     private static int upRange = 3;
@@ -195,7 +203,8 @@ public final class BlockShapeClient implements ClientModInitializer {
 
                     BlockPos pos = cursor.immutable();
                     boolean hiddenTextureBlock = renderHiddenTextures
-                            && state.getRenderShape() == RenderShape.INVISIBLE;
+                            && state.getRenderShape() == RenderShape.INVISIBLE
+                            && shouldRestoreHiddenTextureCategory(state);
 
                     VoxelShape shape = net.minecraft.world.phys.shapes.Shapes.empty();
                     if (renderOutlines) {
@@ -257,6 +266,46 @@ public final class BlockShapeClient implements ClientModInitializer {
         if (LOGGED_RENDER_ERRORS.size() < MAX_LOGGED_RENDER_ERRORS && LOGGED_RENDER_ERRORS.add(blockId)) {
             LOGGER.warn("Could not restore hidden texture for block {}. The renderer will keep running.", blockId, exception);
         }
+    }
+
+    private static boolean shouldRestoreHiddenTextureCategory(BlockState state) {
+        if (state.is(BlockTags.PORTALS) || state.is(Blocks.END_GATEWAY)) return categoryPortals;
+        if (state.is(BlockTags.FIRE) || state.is(BlockTags.CAMPFIRES)) return categoryFire;
+        if (isPlantBlock(state)) return categoryPlants;
+        return true;
+    }
+
+    private static boolean isPlantBlock(BlockState state) {
+        return state.getBlock() instanceof BushBlock
+                || state.is(BlockTags.FLOWERS)
+                || state.is(BlockTags.LEAVES)
+                || state.is(BlockTags.CROPS)
+                || state.is(BlockTags.SAPLINGS)
+                || state.is(BlockTags.CAVE_VINES)
+                || state.is(BlockTags.CORAL_PLANTS)
+                || state.is(BlockTags.FLOWER_POTS);
+    }
+
+    /** Called by the sprite mixin to decide whether a vanilla effect stays on frame one. */
+    public static boolean shouldKeepSpriteStatic(String spriteName) {
+        if (spriteName.equals("minecraft:block/water_still")
+                || spriteName.equals("minecraft:block/water_flow")
+                || spriteName.equals("minecraft:block/lava_still")
+                || spriteName.equals("minecraft:block/lava_flow")) {
+            return categoryLiquids;
+        }
+        if (spriteName.equals("minecraft:block/nether_portal")) return categoryPortals;
+        if (spriteName.equals("minecraft:block/fire_0")
+                || spriteName.equals("minecraft:block/fire_1")
+                || spriteName.equals("minecraft:block/soul_fire_0")
+                || spriteName.equals("minecraft:block/soul_fire_1")) {
+            return categoryFire;
+        }
+        return false;
+    }
+
+    public static boolean isPortalCategoryEnabled() {
+        return categoryPortals;
     }
 
     private static int colorForBlock(BlockState state) {
@@ -375,7 +424,7 @@ public final class BlockShapeClient implements ClientModInitializer {
 
         // Keep vanilla's special display path for chests, heads, bells, portals, etc.
         if (!(displayModel instanceof BlockStateModelWrapper)) {
-            return new CachedTexture(null, false, true);
+            return new CachedTexture(null, false, categorySpecialModels);
         }
 
         BlockStateModel model = minecraft.getModelManager()
@@ -468,11 +517,17 @@ public final class BlockShapeClient implements ClientModInitializer {
                             feedback(context.getSource(), "BlockShape: " + (enabled ? "ON" : "OFF")
                                     + ", radius=" + radius + ", down=" + downRange + ", up=" + upRange + ", width=" + lineWidth
                                     + ", quality=" + qualityPreset
+                                    + ", categories=" + (categoryLiquids ? "L" : "-")
+                                    + (categoryPortals ? "P" : "-")
+                                    + (categoryFire ? "F" : "-")
+                                    + (categoryPlants ? "G" : "-")
+                                    + (categorySpecialModels ? "M" : "-")
                                     + ", outlines=" + (renderOutlines ? "ON" : "OFF")
                                     + ", colors=" + (perBlockColors ? "per-block" : "fixed")
                                     + ", hidden textures=" + (renderHiddenTextures ? "ON" : "OFF"));
+                            feedback(context.getSource(), "Категории L/P/F/G/M = жидкости/порталы/огонь/растения/спецмодели; ON означает обработку категории.");
                             feedback(context.getSource(), "Cached entries=" + cachedShapes.size() + ", unique render errors=" + LOGGED_RENDER_ERRORS.size());
-                            feedback(context.getSource(), "Commands: /bshape on|off|toggle|refresh|quality low|balanced|high|outlines on|off|textures on|off|radius <2..16>|down <0..16>|up <0..16>|width <1..6>|color rainbow|color RRGGBB");
+                            feedback(context.getSource(), "Commands: /bshape on|off|toggle|refresh|quality low|balanced|high|category <liquids|portals|fire|plants|special> <on|off>|outlines on|off|textures on|off|radius <2..16>|down <0..16>|up <0..16>|width <1..6>|color rainbow|color RRGGBB");
                             return 1;
                         })
                         .then(ClientCommands.literal("on").executes(context -> setEnabled(context.getSource(), true)))
@@ -487,6 +542,12 @@ public final class BlockShapeClient implements ClientModInitializer {
                                 .then(ClientCommands.literal("low").executes(context -> setQuality(context.getSource(), "low")))
                                 .then(ClientCommands.literal("balanced").executes(context -> setQuality(context.getSource(), "balanced")))
                                 .then(ClientCommands.literal("high").executes(context -> setQuality(context.getSource(), "high"))))
+                        .then(ClientCommands.literal("category")
+                                .then(textureCategoryCommand("liquids"))
+                                .then(textureCategoryCommand("portals"))
+                                .then(textureCategoryCommand("fire"))
+                                .then(textureCategoryCommand("plants"))
+                                .then(textureCategoryCommand("special")))
                         .then(ClientCommands.literal("outlines")
                                 .then(ClientCommands.literal("on").executes(context -> setOutlines(context.getSource(), true)))
                                 .then(ClientCommands.literal("off").executes(context -> setOutlines(context.getSource(), false))))
@@ -549,6 +610,30 @@ public final class BlockShapeClient implements ClientModInitializer {
                                 })))
                 )
         );
+    }
+
+    private static com.mojang.brigadier.builder.LiteralArgumentBuilder<FabricClientCommandSource> textureCategoryCommand(String name) {
+        return ClientCommands.literal(name)
+                .then(ClientCommands.literal("on").executes(context -> setTextureCategory(context.getSource(), name, true)))
+                .then(ClientCommands.literal("off").executes(context -> setTextureCategory(context.getSource(), name, false)));
+    }
+
+    private static int setTextureCategory(FabricClientCommandSource source, String name, boolean value) {
+        switch (name) {
+            case "liquids" -> categoryLiquids = value;
+            case "portals" -> categoryPortals = value;
+            case "fire" -> categoryFire = value;
+            case "plants" -> categoryPlants = value;
+            case "special" -> categorySpecialModels = value;
+            default -> {
+                source.sendError(Component.literal("[BlockShape] Unknown texture category: " + name));
+                return 0;
+            }
+        }
+        invalidateCache();
+        saveConfig();
+        feedback(source, "Texture category " + name + ": " + (value ? "ON" : "OFF"));
+        return 1;
     }
 
     private static int setQuality(FabricClientCommandSource source, String preset) {
@@ -632,6 +717,11 @@ public final class BlockShapeClient implements ClientModInitializer {
             enabled = Boolean.parseBoolean(properties.getProperty("enabled", "true"));
             renderOutlines = Boolean.parseBoolean(properties.getProperty("renderOutlines", "true"));
             renderHiddenTextures = Boolean.parseBoolean(properties.getProperty("renderHiddenTextures", "true"));
+            categoryLiquids = Boolean.parseBoolean(properties.getProperty("categoryLiquids", "true"));
+            categoryPortals = Boolean.parseBoolean(properties.getProperty("categoryPortals", "true"));
+            categoryFire = Boolean.parseBoolean(properties.getProperty("categoryFire", "true"));
+            categoryPlants = Boolean.parseBoolean(properties.getProperty("categoryPlants", "true"));
+            categorySpecialModels = Boolean.parseBoolean(properties.getProperty("categorySpecialModels", "true"));
             radius = clamp(parseInt(properties.getProperty("radius"), 6), MIN_RADIUS, MAX_RADIUS);
             downRange = clamp(parseInt(properties.getProperty("downRange"), 3), MIN_VERTICAL_RANGE, MAX_VERTICAL_RANGE);
             upRange = clamp(parseInt(properties.getProperty("upRange"), 3), MIN_VERTICAL_RANGE, MAX_VERTICAL_RANGE);
@@ -651,6 +741,11 @@ public final class BlockShapeClient implements ClientModInitializer {
         properties.setProperty("enabled", Boolean.toString(enabled));
         properties.setProperty("renderOutlines", Boolean.toString(renderOutlines));
         properties.setProperty("renderHiddenTextures", Boolean.toString(renderHiddenTextures));
+        properties.setProperty("categoryLiquids", Boolean.toString(categoryLiquids));
+        properties.setProperty("categoryPortals", Boolean.toString(categoryPortals));
+        properties.setProperty("categoryFire", Boolean.toString(categoryFire));
+        properties.setProperty("categoryPlants", Boolean.toString(categoryPlants));
+        properties.setProperty("categorySpecialModels", Boolean.toString(categorySpecialModels));
         properties.setProperty("radius", Integer.toString(radius));
         properties.setProperty("downRange", Integer.toString(downRange));
         properties.setProperty("upRange", Integer.toString(upRange));
