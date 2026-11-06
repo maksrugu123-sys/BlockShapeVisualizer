@@ -105,6 +105,11 @@ public final class BlockShapeClient implements ClientModInitializer {
     private static final Set<String> DISABLED_TEXTURE_BLOCK_IDS = new HashSet<>();
     private static final Set<String> DISABLED_TEXTURE_NAMESPACES = new HashSet<>();
     private static final Map<Block, Integer> BLOCK_COLOR_CACHE = new IdentityHashMap<>();
+    private static final Map<Block, Integer> BLOCK_CATEGORY_MASK_CACHE = new IdentityHashMap<>();
+    private static final int CATEGORY_LIQUID = 1;
+    private static final int CATEGORY_PORTAL = 1 << 1;
+    private static final int CATEGORY_FIRE = 1 << 2;
+    private static final int CATEGORY_PLANT = 1 << 3;
     private static final Path CONFIG_FILE = FabricLoader.getInstance().getConfigDir()
             .resolve("blockshape-visualizer.properties");
     private static final BlockDisplayContext BLOCK_DISPLAY_CONTEXT = BlockDisplayContext.create();
@@ -278,6 +283,7 @@ public final class BlockShapeClient implements ClientModInitializer {
             }
             if (cachedLevel != client.level) {
                 cachedLevel = client.level;
+                BLOCK_CATEGORY_MASK_CACHE.clear();
                 invalidateCache();
             }
 
@@ -572,6 +578,7 @@ public final class BlockShapeClient implements ClientModInitializer {
                         // Cached meshes reference baked models and atlas sprites. They must
                         // never survive a resource-pack reload or F3+T.
                         invalidateCache();
+                        BLOCK_CATEGORY_MASK_CACHE.clear();
                         hiddenTextureMesh = null;
                         hiddenTextureRenderer = null;
                         hiddenTextureRendererInitialized = false;
@@ -779,19 +786,47 @@ public final class BlockShapeClient implements ClientModInitializer {
         }
     }
 
+    private static int blockCategoryMask(BlockState state) {
+        return BLOCK_CATEGORY_MASK_CACHE.computeIfAbsent(state.getBlock(), block -> {
+            int mask = 0;
+            if (block instanceof net.minecraft.world.level.block.LiquidBlock) {
+                mask |= CATEGORY_LIQUID;
+            }
+            if (state.is(BlockTags.PORTALS) || block == Blocks.END_GATEWAY) {
+                mask |= CATEGORY_PORTAL;
+            }
+            if (state.is(BlockTags.FIRE) || state.is(BlockTags.CAMPFIRES)) {
+                mask |= CATEGORY_FIRE;
+            }
+            if (!(block instanceof net.minecraft.world.level.block.LiquidBlock)
+                    && (block instanceof BushBlock
+                    || state.is(BlockTags.FLOWERS)
+                    || state.is(BlockTags.LEAVES)
+                    || state.is(BlockTags.CROPS)
+                    || state.is(BlockTags.SAPLINGS)
+                    || state.is(BlockTags.CAVE_VINES)
+                    || state.is(BlockTags.CORAL_PLANTS)
+                    || state.is(BlockTags.FLOWER_POTS)
+                    || state.is(BlockTags.REPLACEABLE_BY_TREES)
+                    || state.is(BlockTags.REPLACEABLE_BY_MUSHROOMS))) {
+                mask |= CATEGORY_PLANT;
+            }
+            return mask;
+        });
+    }
+
     private static boolean shouldRestoreHiddenTextureCategory(BlockState state) {
         String blockId = BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
         if (DISABLED_TEXTURE_BLOCK_IDS.contains(blockId)) return false;
         int namespaceSeparator = blockId.indexOf(':');
         String namespace = namespaceSeparator > 0 ? blockId.substring(0, namespaceSeparator) : "minecraft";
         if (DISABLED_TEXTURE_NAMESPACES.contains(namespace)) return false;
-        // Keep liquid blocks under their own switch; waterlogged solid blocks are not LiquidBlock instances.
-        if (state.getBlock() instanceof net.minecraft.world.level.block.LiquidBlock) return categoryLiquids;
-        if (state.is(Blocks.END_PORTAL) || state.is(BlockTags.PORTALS) || state.is(Blocks.END_GATEWAY)) return categoryPortals;
-        if (state.is(BlockTags.FIRE) || state.is(BlockTags.CAMPFIRES)) return categoryFire;
-        if (isPlantBlock(state)) return categoryPlants;
-        // Some block entities use an ordinary-looking baked block model. They
-        // still belong to Special Models and must respect that category switch.
+
+        int mask = blockCategoryMask(state);
+        if ((mask & CATEGORY_LIQUID) != 0) return categoryLiquids;
+        if (state.is(Blocks.END_PORTAL) || (mask & CATEGORY_PORTAL) != 0) return categoryPortals;
+        if ((mask & CATEGORY_FIRE) != 0) return categoryFire;
+        if ((mask & CATEGORY_PLANT) != 0) return categoryPlants;
         if (state.hasBlockEntity()) return categorySpecialModels;
         return true;
     }
@@ -802,27 +837,17 @@ public final class BlockShapeClient implements ClientModInitializer {
         int namespaceSeparator = blockId.indexOf(':');
         String namespace = namespaceSeparator > 0 ? blockId.substring(0, namespaceSeparator) : "minecraft";
         if (DISABLED_TEXTURE_NAMESPACES.contains(namespace)) return false;
-        if (state.getBlock() instanceof net.minecraft.world.level.block.LiquidBlock) return categoryLiquids;
-        if (state.is(Blocks.END_PORTAL) || state.is(BlockTags.PORTALS) || state.is(Blocks.END_GATEWAY)) return categoryPortals;
-        if (state.is(BlockTags.FIRE) || state.is(BlockTags.CAMPFIRES)) return categoryFire;
-        if (isPlantBlock(state)) return categoryPlants;
+
+        int mask = blockCategoryMask(state);
+        if ((mask & CATEGORY_LIQUID) != 0) return categoryLiquids;
+        if (state.is(Blocks.END_PORTAL) || (mask & CATEGORY_PORTAL) != 0) return categoryPortals;
+        if ((mask & CATEGORY_FIRE) != 0) return categoryFire;
+        if ((mask & CATEGORY_PLANT) != 0) return categoryPlants;
         return categorySpecialModels;
     }
 
     private static boolean isPlantBlock(BlockState state) {
-        if (state.getBlock() instanceof net.minecraft.world.level.block.LiquidBlock) return false;
-        return state.getBlock() instanceof BushBlock
-                || state.is(BlockTags.FLOWERS)
-                || state.is(BlockTags.LEAVES)
-                || state.is(BlockTags.CROPS)
-                || state.is(BlockTags.SAPLINGS)
-                || state.is(BlockTags.CAVE_VINES)
-                || state.is(BlockTags.CORAL_PLANTS)
-                || state.is(BlockTags.FLOWER_POTS)
-                // Includes 26.3 vegetation such as red shrubs and shelf mushrooms,
-                // and modded plants that opt into these standard tags.
-                || state.is(BlockTags.REPLACEABLE_BY_TREES)
-                || state.is(BlockTags.REPLACEABLE_BY_MUSHROOMS);
+        return (blockCategoryMask(state) & CATEGORY_PLANT) != 0;
     }
 
     /** Called by the sprite mixin to decide whether a vanilla effect stays on frame one. */
@@ -1424,10 +1449,11 @@ public final class BlockShapeClient implements ClientModInitializer {
     }
 
     private static String textureCategoryName(BlockState state, boolean specialModel) {
-        if (state.getBlock() instanceof net.minecraft.world.level.block.LiquidBlock) return "liquids";
-        if (state.is(Blocks.END_PORTAL) || state.is(BlockTags.PORTALS) || state.is(Blocks.END_GATEWAY)) return "portals";
-        if (state.is(BlockTags.FIRE) || state.is(BlockTags.CAMPFIRES)) return "fire";
-        if (isPlantBlock(state)) return "plants";
+        int mask = blockCategoryMask(state);
+        if ((mask & CATEGORY_LIQUID) != 0) return "liquids";
+        if (state.is(Blocks.END_PORTAL) || (mask & CATEGORY_PORTAL) != 0) return "portals";
+        if ((mask & CATEGORY_FIRE) != 0) return "fire";
+        if ((mask & CATEGORY_PLANT) != 0) return "plants";
         return specialModel || state.hasBlockEntity() ? "special models" : "regular block";
     }
 
