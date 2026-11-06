@@ -482,7 +482,9 @@ public final class BlockShapeClient implements ClientModInitializer {
             );
 
             if (hiddenTextureMesh.size() == 0) {
-                return new CachedTexture(null, false, false);
+                // Some non-standard models do not emit world quads through this renderer.
+                // Give Minecraft's regular block display path one chance before giving up.
+                return new CachedTexture(null, false, true);
             }
             return new CachedTexture(hiddenTextureMesh.immutableCopy(), translucent, false);
         } finally {
@@ -746,7 +748,7 @@ public final class BlockShapeClient implements ClientModInitializer {
         applyQualityPreset(qualityPreset);
         invalidateCache();
         saveConfig();
-        feedback(source, "All BlockShape settings restored to defaults");
+        feedback(source, "All BlockShape settings restored to defaults. Reload resources (F3+T, resource-pack toggle, or game restart) to apply liquid/portal/fire animation changes.");
         return 1;
     }
 
