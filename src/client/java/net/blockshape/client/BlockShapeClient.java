@@ -436,39 +436,43 @@ public final class BlockShapeClient implements ClientModInitializer {
             if (!drawHiddenTexture && !drawOutline) continue;
 
             poseStack.pushPose();
-            poseStack.translate(
-                    entry.pos().getX() - camera.x,
-                    entry.pos().getY() - camera.y,
-                    entry.pos().getZ() - camera.z
-            );
-
-            // BlockHider marks world blocks INVISIBLE but keeps their baked models
-            // and the block texture atlas loaded. Submit those original models here.
-            // Normal visible blocks stay on the vanilla path, avoiding z-fighting.
-            if (drawHiddenTexture) {
-                try {
-                    if (entry.hiddenTextureMesh() != null) {
-                        submitCachedHiddenBlockTexture(entry, poseStack, collector);
-                    } else {
-                        submitSpecialHiddenBlockTexture(entry, poseStack, collector);
-                    }
-                } catch (RuntimeException exception) {
-                    // One broken third-party model must not break the whole world render.
-                    logRenderFailure(entry.state(), exception);
-                }
-            }
-
-            if (drawOutline) {
-                collector.submitShapeOutline(
-                        poseStack,
-                        entry.shape(),
-                        RenderTypes.lines(),
-                        entry.color(),
-                        lineWidth,
-                        false
+            try {
+                poseStack.translate(
+                        entry.pos().getX() - camera.x,
+                        entry.pos().getY() - camera.y,
+                        entry.pos().getZ() - camera.z
                 );
+
+                // BlockHider marks world blocks INVISIBLE but keeps their baked models
+                // and the block texture atlas loaded. Submit those original models here.
+                // Normal visible blocks stay on the vanilla path, avoiding z-fighting.
+                if (drawHiddenTexture) {
+                    try {
+                        if (entry.hiddenTextureMesh() != null) {
+                            submitCachedHiddenBlockTexture(entry, poseStack, collector);
+                        } else {
+                            submitSpecialHiddenBlockTexture(entry, poseStack, collector);
+                        }
+                    } catch (RuntimeException exception) {
+                        // One broken third-party model must not break the whole world render.
+                        logRenderFailure(entry.state(), exception);
+                    }
+                }
+
+                if (drawOutline) {
+                    collector.submitShapeOutline(
+                            poseStack,
+                            entry.shape(),
+                            RenderTypes.lines(),
+                            entry.color(),
+                            lineWidth,
+                            false
+                    );
+                }
+            } finally {
+                // Preserve the caller's pose even if a renderer or outline submission fails.
+                poseStack.popPose();
             }
-            poseStack.popPose();
         }
     }
 
@@ -849,8 +853,11 @@ public final class BlockShapeClient implements ClientModInitializer {
 
         String coordinates = pos.getX() + ", " + pos.getY() + ", " + pos.getZ();
         source.sendFeedback(Component.literal("[BlockShape] " + blockId + " at " + coordinates));
+        source.sendFeedback(Component.literal("[BlockShape] State: " + state));
         source.sendFeedback(Component.literal("[BlockShape] Category: " + category
-                + " | RenderShape: " + state.getRenderShape() + " | Model: " + modelType));
+                + " | RenderShape: " + state.getRenderShape()
+                + " | BlockEntity: " + state.hasBlockEntity()
+                + " | Model: " + modelType));
         source.sendFeedback(Component.literal("[BlockShape] Texture restore: "
                 + (restorationEnabled ? "enabled" : "disabled")
                 + " | Cache: " + cacheState));
