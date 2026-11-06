@@ -71,6 +71,7 @@ import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
@@ -200,7 +201,10 @@ public final class BlockShapeClient implements ClientModInitializer {
         private final boolean ambientOcclusion;
         private final Pose playerPose;
         private final boolean fullShapeRefresh;
+        private final boolean partialMode;
         private final Set<BlockPos> dirtyPositions;
+        private final Iterator<BlockPos> dirtyIterator;
+        private BlockPos pendingPosition;
         private final CollisionContext collisionContext;
         private final BlockPos.MutableBlockPos cursor = new BlockPos.MutableBlockPos();
         private int x;
@@ -223,6 +227,7 @@ public final class BlockShapeClient implements ClientModInitializer {
                 boolean ambientOcclusion,
                 Pose playerPose,
                 boolean fullShapeRefresh,
+                boolean partialMode,
                 Set<BlockPos> dirtyPositions
         ) {
             this.level = level;
@@ -237,7 +242,9 @@ public final class BlockShapeClient implements ClientModInitializer {
             this.ambientOcclusion = ambientOcclusion;
             this.playerPose = playerPose;
             this.fullShapeRefresh = fullShapeRefresh;
+            this.partialMode = partialMode;
             this.dirtyPositions = dirtyPositions;
+            this.dirtyIterator = partialMode ? dirtyPositions.iterator() : null;
             this.collisionContext = CollisionContext.of(player);
             this.x = -radius;
             this.y = -down;
@@ -330,6 +337,20 @@ public final class BlockShapeClient implements ClientModInitializer {
         pendingFullShapeRefresh = false;
 
         boolean ambientOcclusion = Minecraft.getInstance().options.ambientOcclusion().get();
+        boolean partialMode = !buildFullShapeRefresh
+                && !buildDirtyPositions.isEmpty()
+                && player.blockPosition().equals(lastCacheOrigin)
+                && cachedPlayerPose == player.getPose()
+                && cachedAmbientOcclusion == ambientOcclusion;
+        if (partialMode) {
+            // Keep unaffected cached shapes and process only the deduplicated dirty neighborhood.
+            for (ShapeEntry previous : cachedShapes) {
+                if (!buildDirtyPositions.contains(previous.pos())) {
+                    cacheBuildEntries.add(previous);
+                }
+            }
+        }
+
         cacheBuildJob = new CacheBuildJob(
                 level,
                 player,
@@ -341,6 +362,7 @@ public final class BlockShapeClient implements ClientModInitializer {
                 ambientOcclusion,
                 player.getPose(),
                 buildFullShapeRefresh,
+                partialMode,
                 buildDirtyPositions
         );
         int verticalSpan = downRange + upRange + 1;
@@ -357,108 +379,128 @@ public final class BlockShapeClient implements ClientModInitializer {
         int textureBuildsRemaining = Math.max(1, (int) (textureBuildBudgetPerTick * adaptiveBudgetScale));
 
         while (positionsRemaining > 0 && !job.complete) {
-            int x = job.x;
-            int y = job.y;
-            int z = job.z;
+            if (job.pendingPosition == null) {
+                if (job.partialMode) {
+                    if (!job.dirtyIterator.hasNext()) {
+                        job.complete = true;
+                        break;
+                    }
+                    job.pendingPosition = job.dirtyIterator.next();
+                } else {
+                    if (job.y > job.up) {
+                        job.complete = true;
+                        break;
+                    }
+                    job.cursor.set(
+                            job.origin.getX() + job.x,
+                            job.origin.getY() + job.y,
+                            job.origin.getZ() + job.z
+                    );
+                    job.pendingPosition = job.cursor.immutable();
+                }
+            }
 
-            if (x * x + z * z <= job.radiusSquared) {
-                job.cursor.set(
-                        job.origin.getX() + x,
-                        job.origin.getY() + y,
-                        job.origin.getZ() + z
-                );
+            BlockPos pos = job.pendingPosition;
+            job.cursor.set(pos);
+            int x = pos.getX() - job.origin.getX();
+            int y = pos.getY() - job.origin.getY();
+            int z = pos.getZ() - job.origin.getZ();
 
-                if (hasNonEmptySection(job.level, job.cursor, nonEmptySectionCache)
-                        && isChunkLoaded(job.level, job.cursor, chunkAvailability)) {
-                    BlockState state = job.level.getBlockState(job.cursor);
-                    if (!state.isAir()) {
-                        BlockPos pos = job.cursor.immutable();
-                        boolean hiddenTextureBlock = renderHiddenTextures
-                                && x * x + z * z <= job.textureRadiusSquared
-                                && state.getRenderShape() == RenderShape.INVISIBLE
-                                && shouldRestoreHiddenTextureCategory(state)
-                                && !isBlockEntityRenderedByBlockHider(state);
+            boolean insideActiveArea = Math.abs(y) <= (y < 0 ? job.down : job.up)
+                    && x * x + z * z <= job.radiusSquared;
+            if (insideActiveArea
+                    && hasNonEmptySection(job.level, job.cursor, nonEmptySectionCache)
+                    && isChunkLoaded(job.level, job.cursor, chunkAvailability)) {
+                BlockState state = job.level.getBlockState(job.cursor);
+                if (!state.isAir()) {
+                    boolean hiddenTextureBlock = renderHiddenTextures
+                            && x * x + z * z <= job.textureRadiusSquared
+                            && state.getRenderShape() == RenderShape.INVISIBLE
+                            && shouldRestoreHiddenTextureCategory(state)
+                            && !isBlockEntityRenderedByBlockHider(state);
 
-                        ShapeEntry previous = previousByPosition.get(pos);
-                        boolean reuseShape = previous != null
-                                && previous.state() == state
-                                && !job.fullShapeRefresh
-                                && job.playerPose == cachedPlayerPose
-                                && !job.dirtyPositions.contains(pos);
+                    ShapeEntry previous = previousByPosition.get(pos);
+                    boolean reuseShape = previous != null
+                            && previous.state() == state
+                            && !job.fullShapeRefresh
+                            && job.playerPose == cachedPlayerPose
+                            && !job.dirtyPositions.contains(pos);
 
-                        VoxelShape shape = net.minecraft.world.phys.shapes.Shapes.empty();
-                        if (renderOutlines) {
-                            if (reuseShape) {
-                                shape = previous.shape();
-                            } else if (state.getBlock() instanceof SnowLayerBlock) {
+                    VoxelShape shape = net.minecraft.world.phys.shapes.Shapes.empty();
+                    if (renderOutlines) {
+                        if (reuseShape) {
+                            shape = previous.shape();
+                        } else if (state.getBlock() instanceof SnowLayerBlock) {
+                            shape = state.getShape(job.level, job.cursor, job.collisionContext);
+                        } else {
+                            shape = state.getCollisionShape(job.level, job.cursor, job.collisionContext);
+                            if (shape.isEmpty()) {
                                 shape = state.getShape(job.level, job.cursor, job.collisionContext);
+                            }
+                        }
+                    }
+
+                    if (!shape.isEmpty() || hiddenTextureBlock) {
+                        int color = renderOutlines
+                                ? (perBlockColors
+                                        ? (reuseShape ? previous.color() : colorForBlock(state))
+                                        : fixedColor)
+                                : fixedColor;
+                        TextureCacheKey textureCacheKey = hiddenTextureBlock
+                                ? createTextureCacheKey(
+                                        job.level, pos, state, chunkAvailability, job.ambientOcclusion
+                                )
+                                : null;
+                        Mesh textureMesh = null;
+                        boolean translucentTexture = false;
+                        boolean specialTexture = false;
+
+                        if (hiddenTextureBlock) {
+                            if (previous != null && textureCacheKey.equals(previous.textureCacheKey())) {
+                                textureMesh = previous.hiddenTextureMesh();
+                                translucentTexture = previous.translucentHiddenTexture();
+                                specialTexture = previous.specialHiddenTexture();
+                                job.reusedEntries++;
                             } else {
-                                shape = state.getCollisionShape(job.level, job.cursor, job.collisionContext);
-                                if (shape.isEmpty()) {
-                                    shape = state.getShape(job.level, job.cursor, job.collisionContext);
+                                // Keep the current position pending if the per-tick texture budget is exhausted.
+                                if (textureBuildsRemaining <= 0) break;
+                                textureBuildsRemaining--;
+                                job.rebuiltEntries++;
+                                CachedTexture texture;
+                                try {
+                                    texture = buildHiddenTextureMesh(job.level, pos, state);
+                                } catch (RuntimeException exception) {
+                                    logRenderFailure(state, exception);
+                                    texture = new CachedTexture(null, false, true);
                                 }
+                                textureMesh = texture.mesh();
+                                translucentTexture = texture.translucent();
+                                specialTexture = texture.specialModel();
                             }
                         }
 
-                        if (!shape.isEmpty() || hiddenTextureBlock) {
-                            int color = renderOutlines
-                                    ? (perBlockColors
-                                            ? (reuseShape ? previous.color() : colorForBlock(state))
-                                            : fixedColor)
-                                    : fixedColor;
-                            TextureCacheKey textureCacheKey = hiddenTextureBlock
-                                    ? createTextureCacheKey(
-                                            job.level, pos, state, chunkAvailability, job.ambientOcclusion
-                                    )
-                                    : null;
-                            Mesh textureMesh = null;
-                            boolean translucentTexture = false;
-                            boolean specialTexture = false;
-
-                            if (hiddenTextureBlock) {
-                                if (previous != null && textureCacheKey.equals(previous.textureCacheKey())) {
-                                    textureMesh = previous.hiddenTextureMesh();
-                                    translucentTexture = previous.translucentHiddenTexture();
-                                    specialTexture = previous.specialHiddenTexture();
-                                    job.reusedEntries++;
-                                } else {
-                                    // Pause before an expensive model build when this tick's budget is used.
-                                    if (textureBuildsRemaining <= 0) break;
-                                    textureBuildsRemaining--;
-                                    job.rebuiltEntries++;
-                                    CachedTexture texture;
-                                    try {
-                                        texture = buildHiddenTextureMesh(job.level, pos, state);
-                                    } catch (RuntimeException exception) {
-                                        logRenderFailure(state, exception);
-                                        texture = new CachedTexture(null, false, true);
-                                    }
-                                    textureMesh = texture.mesh();
-                                    translucentTexture = texture.translucent();
-                                    specialTexture = texture.specialModel();
-                                }
-                            }
-
-                            AABB bounds = reuseShape ? previous.bounds() : new AABB(
-                                    pos.getX() - 0.25,
-                                    pos.getY() - 0.25,
-                                    pos.getZ() - 0.25,
-                                    pos.getX() + 1.25,
-                                    pos.getY() + 1.25,
-                                    pos.getZ() + 1.25
-                            );
-                            cacheBuildEntries.add(new ShapeEntry(
-                                    pos, bounds, state, shape, color, textureCacheKey,
-                                    textureMesh, translucentTexture, specialTexture
-                            ));
-                        }
+                        AABB bounds = reuseShape ? previous.bounds() : new AABB(
+                                pos.getX() - 0.25,
+                                pos.getY() - 0.25,
+                                pos.getZ() - 0.25,
+                                pos.getX() + 1.25,
+                                pos.getY() + 1.25,
+                                pos.getZ() + 1.25
+                        );
+                        cacheBuildEntries.add(new ShapeEntry(
+                                pos, bounds, state, shape, color, textureCacheKey,
+                                textureMesh, translucentTexture, specialTexture
+                        ));
                     }
                 }
             }
 
             job.scannedPositions++;
             positionsRemaining--;
-            advanceCacheBuildPosition(job);
+            job.pendingPosition = null;
+            if (!job.partialMode) {
+                advanceCacheBuildPosition(job);
+            }
         }
 
         long passNanos = System.nanoTime() - passStarted;
@@ -491,7 +533,6 @@ public final class BlockShapeClient implements ClientModInitializer {
             nonEmptySectionCache.clear();
         }
     }
-
     private static void advanceCacheBuildPosition(CacheBuildJob job) {
         job.x++;
         if (job.x > job.radius) {
