@@ -307,6 +307,7 @@ public final class BlockShapeClient implements ClientModInitializer {
     }
 
     private static boolean isPlantBlock(BlockState state) {
+        if (state.getBlock() instanceof net.minecraft.world.level.block.LiquidBlock) return false;
         return state.getBlock() instanceof BushBlock
                 || state.is(BlockTags.FLOWERS)
                 || state.is(BlockTags.LEAVES)
@@ -314,7 +315,11 @@ public final class BlockShapeClient implements ClientModInitializer {
                 || state.is(BlockTags.SAPLINGS)
                 || state.is(BlockTags.CAVE_VINES)
                 || state.is(BlockTags.CORAL_PLANTS)
-                || state.is(BlockTags.FLOWER_POTS);
+                || state.is(BlockTags.FLOWER_POTS)
+                // Includes 26.3 vegetation such as red shrubs and shelf mushrooms,
+                // and modded plants that opt into these standard tags.
+                || state.is(BlockTags.REPLACEABLE_BY_TREES)
+                || state.is(BlockTags.REPLACEABLE_BY_MUSHROOMS);
     }
 
     /** Called by the sprite mixin to decide whether a vanilla effect stays on frame one. */
