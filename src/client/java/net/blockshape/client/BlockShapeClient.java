@@ -665,7 +665,10 @@ public final class BlockShapeClient implements ClientModInitializer {
         }
         invalidateCache();
         saveConfig();
-        feedback(source, "Texture category " + name + ": " + (value ? "ON" : "OFF"));
+        String reloadHint = (name.equals("liquids") || name.equals("portals") || name.equals("fire"))
+                ? " Resource reload (F3+T) applies sprite animation changes."
+                : "";
+        feedback(source, "Texture category " + name + ": " + (value ? "ON" : "OFF") + reloadHint);
         return 1;
     }
 
