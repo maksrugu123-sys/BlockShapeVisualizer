@@ -63,6 +63,7 @@ import java.io.Reader;
 import java.io.Writer;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
@@ -120,6 +121,8 @@ public final class BlockShapeClient implements ClientModInitializer {
     private static String qualityPreset = "balanced";
     private static BlockPos lastCacheOrigin = BlockPos.ZERO;
     private static ClientLevel cachedLevel;
+    private static boolean blockHiderApiResolved;
+    private static Method blockHiderShouldShowBlockEntity;
     private static List<ShapeEntry> cachedShapes = List.of();
     private static int lastReusedEntries;
     private static int lastRebuiltEntries;
@@ -237,7 +240,8 @@ public final class BlockShapeClient implements ClientModInitializer {
                     // allow the Special Models category to try the baked-model fallback.
                     boolean hiddenTextureBlock = renderHiddenTextures
                             && state.getRenderShape() == RenderShape.INVISIBLE
-                            && shouldRestoreHiddenTextureCategory(state);
+                            && shouldRestoreHiddenTextureCategory(state)
+                            && !isBlockEntityRenderedByBlockHider(state);
 
                     VoxelShape shape = net.minecraft.world.phys.shapes.Shapes.empty();
                     if (renderOutlines) {
@@ -432,6 +436,44 @@ public final class BlockShapeClient implements ClientModInitializer {
         String blockId = BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
         if (LOGGED_RENDER_ERRORS.size() < MAX_LOGGED_RENDER_ERRORS && LOGGED_RENDER_ERRORS.add(blockId)) {
             LOGGER.warn("Could not restore hidden texture for block {}. The renderer will keep running.", blockId, exception);
+        }
+    }
+
+    /**
+     * Optional integration with BlockHider without a compile-time dependency.
+     * If BlockHider's public category filter says its native block-entity renderer
+     * is active, do not submit a second baked-model fallback for the same object.
+     * If BlockHider suppresses that renderer, BlockShape may still try its local
+     * fallback when Special Models is enabled.
+     */
+    private static boolean isBlockEntityRenderedByBlockHider(BlockState state) {
+        if (!state.hasBlockEntity() || !FabricLoader.getInstance().isModLoaded("blockhider")) {
+            return false;
+        }
+
+        if (!blockHiderApiResolved) {
+            blockHiderApiResolved = true;
+            try {
+                Class<?> configClass = Class.forName(
+                        "net.blockhider.client.BlockHiderConfig",
+                        false,
+                        BlockShapeClient.class.getClassLoader()
+                );
+                blockHiderShouldShowBlockEntity = configClass.getMethod(
+                        "shouldShowBlockEntity",
+                        BlockState.class
+                );
+            } catch (ReflectiveOperationException | LinkageError exception) {
+                LOGGER.debug("BlockHider optional category API is unavailable; keeping BlockShape fallback behavior.", exception);
+            }
+        }
+
+        if (blockHiderShouldShowBlockEntity == null) return false;
+        try {
+            return Boolean.TRUE.equals(blockHiderShouldShowBlockEntity.invoke(null, state));
+        } catch (ReflectiveOperationException | RuntimeException exception) {
+            LOGGER.debug("Could not query BlockHider's block-entity visibility; keeping BlockShape fallback behavior.", exception);
+            return false;
         }
     }
 
@@ -964,7 +1006,8 @@ public final class BlockShapeClient implements ClientModInitializer {
         String category = textureCategoryName(state, specialModel);
         boolean restorationEnabled = renderHiddenTextures
                 && shouldRestoreHiddenTextureCategory(state)
-                && (!specialModel || shouldRestoreSpecialModelCategory(state));
+                && (!specialModel || shouldRestoreSpecialModelCategory(state))
+                && !isBlockEntityRenderedByBlockHider(state);
         ShapeEntry cached = cachedShapes.stream()
                 .filter(entry -> entry.pos().equals(pos))
                 .findFirst()

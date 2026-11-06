@@ -15,7 +15,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  */
 @Mixin(ClientLevel.class)
 public abstract class ClientLevelBlockUpdateMixin {
-    @Inject(method = "setBlock", at = @At("RETURN"), require = 1)
+    @Inject(method = "setBlock(Lnet/minecraft/core/BlockPos;Lnet/minecraft/world/level/block/state/BlockState;II)Z", at = @At("RETURN"), require = 1)
     private void blockshape$invalidateChangedBlock(
             BlockPos pos,
             BlockState newState,
