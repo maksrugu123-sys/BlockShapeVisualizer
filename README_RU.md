@@ -23,6 +23,7 @@
 - `/bshape on` — включить.
 - `/bshape off` — выключить.
 - `/bshape toggle` — переключить.
+- `/bshape inspect` — показать ID, категорию, модель, состояние рендеринга и кэша блока, на который направлен прицел.
 - `/bshape refresh` — принудительно перестроить кэш блоков и текстур.
 - `/bshape quality low|balanced|high` — выбрать мобильный профиль производительности.
 - `/bshape category <liquids|portals|fire|plants|special> on|off` — независимо включить или выключить обработку категории текстур.

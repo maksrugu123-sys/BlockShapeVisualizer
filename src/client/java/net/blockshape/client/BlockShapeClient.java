@@ -39,6 +39,7 @@ import net.minecraft.world.level.block.BushBlock;
 import net.minecraft.world.level.block.RenderShape;
 import net.minecraft.world.level.block.SnowLayerBlock;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.phys.shapes.CollisionContext;
 import net.minecraft.world.phys.shapes.VoxelShape;
@@ -555,12 +556,13 @@ public final class BlockShapeClient implements ClientModInitializer {
                                     + ", hidden textures=" + (renderHiddenTextures ? "ON" : "OFF"));
                             feedback(context.getSource(), "Категории L/P/F/G/M = жидкости/порталы/огонь/растения/спецмодели; ON означает обработку категории.");
                             feedback(context.getSource(), "Cached entries=" + cachedShapes.size() + ", unique render errors=" + LOGGED_RENDER_ERRORS.size());
-                            feedback(context.getSource(), "Commands: /bshape on|off|toggle|refresh|reset|block <namespace:id> <on|off>|quality low|balanced|high|category <liquids|portals|fire|plants|special> <on|off>|outlines on|off|textures on|off|radius <2..16>|down <0..16>|up <0..16>|width <1..6>|color rainbow|color RRGGBB");
+                            feedback(context.getSource(), "Commands: /bshape on|off|toggle|inspect|refresh|reset|block <namespace:id> <on|off>|quality low|balanced|high|category <liquids|portals|fire|plants|special> <on|off>|outlines on|off|textures on|off|radius <2..16>|down <0..16>|up <0..16>|width <1..6>|color rainbow|color RRGGBB");
                             return 1;
                         })
                         .then(ClientCommands.literal("on").executes(context -> setEnabled(context.getSource(), true)))
                         .then(ClientCommands.literal("off").executes(context -> setEnabled(context.getSource(), false)))
                         .then(ClientCommands.literal("toggle").executes(context -> setEnabled(context.getSource(), !enabled)))
+                        .then(ClientCommands.literal("inspect").executes(context -> inspectTargetBlock(context.getSource())))
                         .then(ClientCommands.literal("refresh").executes(context -> {
                             invalidateCache();
                             feedback(context.getSource(), "Nearby block and texture cache will be rebuilt now");
@@ -726,6 +728,59 @@ public final class BlockShapeClient implements ClientModInitializer {
                 refreshIntervalTicks = DEFAULT_REFRESH_INTERVAL_TICKS;
             }
         }
+    }
+
+    private static int inspectTargetBlock(FabricClientCommandSource source) {
+        Minecraft minecraft = Minecraft.getInstance();
+        if (minecraft.level == null || minecraft.player == null) {
+            source.sendError(Component.literal("[BlockShape] You must be in a world to inspect a block."));
+            return 0;
+        }
+        if (!(minecraft.hitResult instanceof BlockHitResult hit)) {
+            source.sendError(Component.literal("[BlockShape] Aim at a block first."));
+            return 0;
+        }
+
+        BlockPos pos = hit.getBlockPos();
+        BlockState state = minecraft.level.getBlockState(pos);
+        String blockId = BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
+        String modelType = "unknown";
+        boolean specialModel = false;
+        try {
+            BlockModel model = minecraft.getModelManager().getBlockModelSet().get(state);
+            modelType = model.getClass().getSimpleName();
+            specialModel = !(model instanceof BlockStateModelWrapper);
+        } catch (RuntimeException exception) {
+            logRenderFailure(state, exception);
+            modelType = "lookup failed";
+        }
+
+        String category = textureCategoryName(state, specialModel);
+        boolean restorationEnabled = renderHiddenTextures && shouldRestoreHiddenTextureCategory(state);
+        ShapeEntry cached = cachedShapes.stream()
+                .filter(entry -> entry.pos().equals(pos))
+                .findFirst()
+                .orElse(null);
+        String cacheState = cached == null ? "not cached"
+                : cached.hiddenTextureMesh() != null ? "mesh cached"
+                : cached.specialHiddenTexture() ? "special fallback"
+                : "shape only";
+
+        source.sendFeedback(Component.literal("[BlockShape] " + blockId + " at " + pos.toShortString()));
+        source.sendFeedback(Component.literal("[BlockShape] Category: " + category
+                + " | RenderShape: " + state.getRenderShape() + " | Model: " + modelType));
+        source.sendFeedback(Component.literal("[BlockShape] Texture restore: "
+                + (restorationEnabled ? "enabled" : "disabled")
+                + " | Cache: " + cacheState));
+        return 1;
+    }
+
+    private static String textureCategoryName(BlockState state, boolean specialModel) {
+        if (state.getBlock() instanceof net.minecraft.world.level.block.LiquidBlock) return "liquids";
+        if (state.is(Blocks.END_PORTAL) || state.is(BlockTags.PORTALS) || state.is(Blocks.END_GATEWAY)) return "portals";
+        if (state.is(BlockTags.FIRE) || state.is(BlockTags.CAMPFIRES)) return "fire";
+        if (isPlantBlock(state)) return "plants";
+        return specialModel ? "special models" : "regular block";
     }
 
     private static int resetSettings(FabricClientCommandSource source) {
