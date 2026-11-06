@@ -30,6 +30,8 @@
 - `/bshape category <liquids|portals|fire|plants|special> on|off` — независимо включить или выключить обработку категории текстур.
 - `/bshape block minecraft:stone off` — отключить восстановление текстуры указанного блока.
 - `/bshape block minecraft:stone on` — снова включить восстановление текстуры этого блока.
+- `/bshape namespace examplemod off` — отключить восстановление всех блоков namespace мода.
+- `/bshape namespace examplemod on` — снова включить их.
 - После изменения категорий жидкостей, порталов или огня перезагрузи ресурсы клавишами `F3+T`, чтобы обновить состояния анимации атласа.
 - `/bshape reset` — сбросить настройки, включая список исключённых блоков.
 - `/bshape radius 8` — горизонтальный радиус 8 блоков (допустимо 2–16).
@@ -40,7 +42,7 @@
 - `/bshape color 33CCFF` — единый цвет для всех блоков.
 
 ## Сборка
-Требуется JDK 25 и Gradle 9.6.0. Для Minecraft 26.3 Fabric рекомендует Loom 1.17+; проект использует Loom 1.19-SNAPSHOT.
+Требуется JDK 25 и Gradle 9.8.0 (та же версия используется в GitHub Actions). Для Minecraft 26.3 Fabric рекомендует Loom 1.17+; проект использует Loom 1.19-SNAPSHOT.
 
 ```bash
 gradle build
