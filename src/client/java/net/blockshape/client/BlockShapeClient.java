@@ -26,6 +26,7 @@ import net.minecraft.client.renderer.block.model.BlockStateModelWrapper;
 import net.minecraft.client.renderer.rendertype.RenderTypes;
 import net.minecraft.client.renderer.texture.OverlayTexture;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Holder;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.tags.BlockTags;
 import net.minecraft.network.chat.Component;
@@ -44,6 +45,7 @@ import net.minecraft.world.level.block.BushBlock;
 import net.minecraft.world.level.block.RenderShape;
 import net.minecraft.world.level.block.SnowLayerBlock;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.biome.Biome;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.phys.shapes.CollisionContext;
@@ -120,11 +122,27 @@ public final class BlockShapeClient implements ClientModInitializer {
     private static ClientLevel cachedLevel;
     private static List<ShapeEntry> cachedShapes = List.of();
 
+    private record NeighborSnapshot(BlockState state, int packedLight) {}
+
+    private record TextureCacheKey(
+            BlockState state,
+            NeighborSnapshot north,
+            NeighborSnapshot south,
+            NeighborSnapshot east,
+            NeighborSnapshot west,
+            NeighborSnapshot above,
+            NeighborSnapshot below,
+            int packedLight,
+            Holder<Biome> biome,
+            boolean ambientOcclusion
+    ) {}
+
     private record ShapeEntry(
             BlockPos pos,
             BlockState state,
             VoxelShape shape,
             int color,
+            TextureCacheKey textureCacheKey,
             Mesh hiddenTextureMesh,
             boolean translucentHiddenTexture,
             boolean specialHiddenTexture
@@ -190,6 +208,10 @@ public final class BlockShapeClient implements ClientModInitializer {
         int expectedEntries = Math.max(16, (int) (Math.PI * radiusSquared * verticalSpan));
         List<ShapeEntry> result = new ArrayList<>(expectedEntries);
         Map<Long, Boolean> chunkAvailability = new HashMap<>();
+        Map<BlockPos, ShapeEntry> previousByPosition = new HashMap<>(cachedShapes.size());
+        for (ShapeEntry previous : cachedShapes) {
+            previousByPosition.put(previous.pos(), previous);
+        }
 
         // Check each chunk only once instead of asking Level for every block position.
         for (int y = -down; y <= up; y++) {
@@ -198,14 +220,7 @@ public final class BlockShapeClient implements ClientModInitializer {
                     if (x * x + z * z > radiusSquared) continue;
                     cursor.set(origin.getX() + x, origin.getY() + y, origin.getZ() + z);
 
-                    long chunkKey = ((long) (cursor.getX() >> 4) << 32)
-                            | ((cursor.getZ() >> 4) & 0xFFFFFFFFL);
-                    Boolean chunkLoaded = chunkAvailability.get(chunkKey);
-                    if (chunkLoaded == null) {
-                        chunkLoaded = level.hasChunkAt(cursor);
-                        chunkAvailability.put(chunkKey, chunkLoaded);
-                    }
-                    if (!chunkLoaded) continue;
+                    if (!isChunkLoaded(level, cursor, chunkAvailability)) continue;
 
                     BlockState state = level.getBlockState(cursor);
                     if (state.isAir()) continue;
@@ -238,24 +253,35 @@ public final class BlockShapeClient implements ClientModInitializer {
                     int color = renderOutlines
                             ? (perBlockColors ? colorForBlock(state) : fixedColor)
                             : fixedColor;
+                    TextureCacheKey textureCacheKey = hiddenTextureBlock
+                            ? createTextureCacheKey(level, pos, state, chunkAvailability)
+                            : null;
                     Mesh textureMesh = null;
                     boolean translucentTexture = false;
                     boolean specialTexture = false;
                     if (hiddenTextureBlock) {
-                        CachedTexture texture;
-                        try {
-                            texture = buildHiddenTextureMesh(level, pos, state);
-                        } catch (RuntimeException exception) {
-                            logRenderFailure(state, exception);
-                            // Try the vanilla display-state path for a model the world tessellator rejects.
-                            texture = new CachedTexture(null, false, true);
+                        ShapeEntry previous = previousByPosition.get(pos);
+                        if (previous != null && textureCacheKey.equals(previous.textureCacheKey())) {
+                            // Reuse an immutable mesh when block state, neighbors, biome and light are unchanged.
+                            textureMesh = previous.hiddenTextureMesh();
+                            translucentTexture = previous.translucentHiddenTexture();
+                            specialTexture = previous.specialHiddenTexture();
+                        } else {
+                            CachedTexture texture;
+                            try {
+                                texture = buildHiddenTextureMesh(level, pos, state);
+                            } catch (RuntimeException exception) {
+                                logRenderFailure(state, exception);
+                                // Try the vanilla display-state path for a model the world tessellator rejects.
+                                texture = new CachedTexture(null, false, true);
+                            }
+                            textureMesh = texture.mesh();
+                            translucentTexture = texture.translucent();
+                            specialTexture = texture.specialModel();
                         }
-                        textureMesh = texture.mesh();
-                        translucentTexture = texture.translucent();
-                        specialTexture = texture.specialModel();
                     }
                     result.add(new ShapeEntry(
-                            pos, state, shape, color,
+                            pos, state, shape, color, textureCacheKey,
                             textureMesh, translucentTexture, specialTexture
                     ));
                 }
@@ -281,6 +307,55 @@ public final class BlockShapeClient implements ClientModInitializer {
                         LOGGER.debug("Resource reload invalidated BlockShape texture meshes.");
                     }
                 }
+        );
+    }
+
+    private static boolean isChunkLoaded(
+            ClientLevel level,
+            BlockPos pos,
+            Map<Long, Boolean> chunkAvailability
+    ) {
+        long chunkKey = ((long) (pos.getX() >> 4) << 32)
+                | ((pos.getZ() >> 4) & 0xFFFFFFFFL);
+        Boolean loaded = chunkAvailability.get(chunkKey);
+        if (loaded == null) {
+            loaded = level.hasChunkAt(pos);
+            chunkAvailability.put(chunkKey, loaded);
+        }
+        return loaded;
+    }
+
+    private static NeighborSnapshot snapshotNeighbor(
+            ClientLevel level,
+            BlockPos pos,
+            Map<Long, Boolean> chunkAvailability
+    ) {
+        if (!isChunkLoaded(level, pos, chunkAvailability)) {
+            return new NeighborSnapshot(Blocks.AIR.defaultBlockState(), 0);
+        }
+        return new NeighborSnapshot(
+                level.getBlockState(pos),
+                LightCoordsUtil.getLightCoords(level, pos)
+        );
+    }
+
+    private static TextureCacheKey createTextureCacheKey(
+            ClientLevel level,
+            BlockPos pos,
+            BlockState state,
+            Map<Long, Boolean> chunkAvailability
+    ) {
+        return new TextureCacheKey(
+                state,
+                snapshotNeighbor(level, pos.north(), chunkAvailability),
+                snapshotNeighbor(level, pos.south(), chunkAvailability),
+                snapshotNeighbor(level, pos.east(), chunkAvailability),
+                snapshotNeighbor(level, pos.west(), chunkAvailability),
+                snapshotNeighbor(level, pos.above(), chunkAvailability),
+                snapshotNeighbor(level, pos.below(), chunkAvailability),
+                LightCoordsUtil.getLightCoords(level, pos),
+                level.getBiome(pos),
+                cachedAmbientOcclusion
         );
     }
 
@@ -338,6 +413,7 @@ public final class BlockShapeClient implements ClientModInitializer {
                     })
                     .toList();
         }
+        ticksSinceRefresh = refreshIntervalTicks;
     }
 
     private static void logRenderFailure(BlockState state, RuntimeException exception) {
