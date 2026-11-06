@@ -5,6 +5,7 @@
   "refmap": "blockshape.refmap.json",
   "client": [
     "ClientLevelBlockUpdateMixin",
+    "ClientChunkCacheLightUpdateMixin",
     "SpriteContentsMixin",
     "AbstractEndPortalRendererMixin"
   ],

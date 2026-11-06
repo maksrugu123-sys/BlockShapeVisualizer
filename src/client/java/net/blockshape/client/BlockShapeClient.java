@@ -4,6 +4,7 @@ import com.mojang.brigadier.arguments.FloatArgumentType;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.blaze3d.vertex.PoseStack;
+import net.minecraft.core.SectionPos;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommands;
@@ -88,10 +89,11 @@ public final class BlockShapeClient implements ClientModInitializer {
     private static final int MAX_RADIUS = 32;
     private static final int MIN_TEXTURE_RADIUS = 1;
     private static final int MAX_TEXTURE_RADIUS = 32;
-    private static final int DEFAULT_TEXTURE_RADIUS = 16;
+    private static final int DEFAULT_TEXTURE_RADIUS = 8;
     private static final int MIN_VERTICAL_RANGE = 0;
     private static final int MAX_VERTICAL_RANGE = 16;
-    private static final int DEFAULT_REFRESH_INTERVAL_TICKS = 10;
+    private static final int DEFAULT_REFRESH_INTERVAL_TICKS = 1200;
+    private static final int MAX_RETAINED_CACHE_ENTRIES = 8192;
     private static final int MOVEMENT_REFRESH_DISTANCE_SQUARED = 4;
     private static final int MIN_EVENT_REFRESH_INTERVAL_TICKS = 3;
     private static int refreshIntervalTicks = DEFAULT_REFRESH_INTERVAL_TICKS;
@@ -148,13 +150,15 @@ public final class BlockShapeClient implements ClientModInitializer {
     // during repeated cache rebuilds, especially on mobile devices.
     private static ArrayList<ShapeEntry> cachedShapes = new ArrayList<>();
     private static ArrayList<ShapeEntry> cacheBuildEntries = new ArrayList<>();
-    private static final Map<BlockPos, ShapeEntry> previousByPosition = new HashMap<>();
+    private static Map<BlockPos, ShapeEntry> previousByPosition = new HashMap<>();
     private static final Map<Long, ShapeChunkBucket> cachedChunkBuckets = new LinkedHashMap<>();
     private static final Map<Long, Boolean> chunkAvailability = new HashMap<>();
     private static final Map<Long, Boolean> nonEmptySectionCache = new HashMap<>();
     // Event-driven dirty positions are deduplicated and consumed by the next cache job.
     private static Set<BlockPos> pendingDirtyPositions = new HashSet<>();
     private static Set<BlockPos> buildDirtyPositions = new HashSet<>();
+    private static Set<BlockPos> pendingShapeDirtyPositions = new HashSet<>();
+    private static Set<BlockPos> buildShapeDirtyPositions = new HashSet<>();
     private static boolean pendingFullShapeRefresh = true;
     private static boolean buildFullShapeRefresh = true;
     private static Pose cachedPlayerPose;
@@ -164,6 +168,18 @@ public final class BlockShapeClient implements ClientModInitializer {
     private static int lastRebuiltEntries;
     private static int lastScannedPositions;
     private static double lastRebuildMillis;
+    private static long lastSliceNanos;
+    private static long maxSliceNanos;
+    private static int lastRenderSectionsVisited;
+    private static int lastRenderSectionsCulled;
+    private static int lastRenderEntriesVisited;
+    private static int lastRenderEntriesCulled;
+    private static int lastRenderTextureSubmissions;
+    private static int lastRenderOutlineEntries;
+    private static double lastRenderPreparationMillis;
+    private static double lastOutlineBatchMillis;
+    private static final Set<Long> pendingLightSections = new HashSet<>();
+    private static final ArrayList<ShapeEntry> outlineSubmitEntries = new ArrayList<>();
 
     private record NeighborSnapshot(BlockState state, int packedLight) {}
 
@@ -213,6 +229,7 @@ public final class BlockShapeClient implements ClientModInitializer {
         private final boolean fullShapeRefresh;
         private final boolean partialMode;
         private final Set<BlockPos> dirtyPositions;
+        private final Set<BlockPos> shapeDirtyPositions;
         private final Iterator<BlockPos> dirtyIterator;
         private BlockPos pendingPosition;
         private final CollisionContext collisionContext;
@@ -238,7 +255,8 @@ public final class BlockShapeClient implements ClientModInitializer {
                 Pose playerPose,
                 boolean fullShapeRefresh,
                 boolean partialMode,
-                Set<BlockPos> dirtyPositions
+                Set<BlockPos> dirtyPositions,
+                Set<BlockPos> shapeDirtyPositions
         ) {
             this.level = level;
             this.player = player;
@@ -254,6 +272,7 @@ public final class BlockShapeClient implements ClientModInitializer {
             this.fullShapeRefresh = fullShapeRefresh;
             this.partialMode = partialMode;
             this.dirtyPositions = dirtyPositions;
+            this.shapeDirtyPositions = shapeDirtyPositions;
             this.dirtyIterator = partialMode ? dirtyPositions.iterator() : null;
             this.collisionContext = CollisionContext.of(player);
             this.x = -radius;
@@ -278,9 +297,11 @@ public final class BlockShapeClient implements ClientModInitializer {
             }
             if (!enabled) {
                 cancelCacheBuild();
-                cachedShapes.clear();
-                cacheBuildEntries.clear();
+                cachedShapes = releaseCacheBuffer(cachedShapes);
+                cacheBuildEntries = releaseCacheBuffer(cacheBuildEntries);
                 cachedChunkBuckets.clear();
+                pendingLightSections.clear();
+                outlineSubmitEntries.clear();
                 lastReusedEntries = 0;
                 lastRebuiltEntries = 0;
                 lastScannedPositions = 0;
@@ -292,6 +313,8 @@ public final class BlockShapeClient implements ClientModInitializer {
                 BLOCK_CATEGORY_MASK_CACHE.clear();
                 invalidateCache();
             }
+
+            drainPendingLightSections();
 
             boolean ambientOcclusion = client.options.ambientOcclusion().get();
             if (cacheBuildJob != null) {
@@ -345,6 +368,11 @@ public final class BlockShapeClient implements ClientModInitializer {
         buildDirtyPositions = pendingDirtyPositions;
         pendingDirtyPositions = previousDirtyBuffer;
         pendingDirtyPositions.clear();
+
+        Set<BlockPos> previousShapeDirtyBuffer = buildShapeDirtyPositions;
+        buildShapeDirtyPositions = pendingShapeDirtyPositions;
+        pendingShapeDirtyPositions = previousShapeDirtyBuffer;
+        pendingShapeDirtyPositions.clear();
         buildFullShapeRefresh = pendingFullShapeRefresh;
         pendingFullShapeRefresh = false;
 
@@ -375,7 +403,8 @@ public final class BlockShapeClient implements ClientModInitializer {
                 player.getPose(),
                 buildFullShapeRefresh,
                 partialMode,
-                buildDirtyPositions
+                buildDirtyPositions,
+                buildShapeDirtyPositions
         );
         int verticalSpan = downRange + upRange + 1;
         int expectedEntries = Math.max(16, (int) (Math.PI * radius * radius * verticalSpan));
@@ -440,7 +469,7 @@ public final class BlockShapeClient implements ClientModInitializer {
                             && previous.state() == state
                             && !job.fullShapeRefresh
                             && job.playerPose == cachedPlayerPose
-                            && !job.dirtyPositions.contains(pos);
+                            && !job.shapeDirtyPositions.contains(pos);
 
                     VoxelShape shape = net.minecraft.world.phys.shapes.Shapes.empty();
                     if (renderOutlines) {
@@ -521,6 +550,8 @@ public final class BlockShapeClient implements ClientModInitializer {
         }
 
         long passNanos = System.nanoTime() - passStarted;
+        lastSliceNanos = passNanos;
+        maxSliceNanos = Math.max(maxSliceNanos, passNanos);
         job.cpuNanos += passNanos;
         // Keep each client-tick slice small on slower devices; recover gradually when headroom returns.
         if (passNanos > CACHE_SLICE_TARGET_NANOS) {
@@ -534,16 +565,18 @@ public final class BlockShapeClient implements ClientModInitializer {
             cacheBuildEntries = previousBuffer;
             // Drop stale entry/mesh references immediately; the new active cache
             // already retains every mesh that is still reusable.
-            cacheBuildEntries.clear();
+            cacheBuildEntries = releaseCacheBuffer(cacheBuildEntries);
             lastCacheOrigin = job.origin;
             cachedAmbientOcclusion = job.ambientOcclusion;
             cachedPlayerPose = job.playerPose;
             buildDirtyPositions.clear();
+            buildShapeDirtyPositions.clear();
             buildFullShapeRefresh = false;
             lastReusedEntries = job.reusedEntries;
             lastRebuiltEntries = job.rebuiltEntries;
             lastScannedPositions = job.scannedPositions;
             lastRebuildMillis = job.cpuNanos / 1_000_000.0;
+            maxSliceNanos = Math.max(maxSliceNanos, lastSliceNanos);
             cacheBuildJob = null;
             rebuildChunkBuckets();
             previousByPosition.clear();
@@ -571,10 +604,12 @@ public final class BlockShapeClient implements ClientModInitializer {
             pendingFullShapeRefresh = true;
         } else if (!buildDirtyPositions.isEmpty()) {
             pendingDirtyPositions.addAll(buildDirtyPositions);
+            pendingShapeDirtyPositions.addAll(buildShapeDirtyPositions);
         }
         cacheBuildJob = null;
-        cacheBuildEntries.clear();
+        cacheBuildEntries = releaseCacheBuffer(cacheBuildEntries);
         buildDirtyPositions.clear();
+        buildShapeDirtyPositions.clear();
         buildFullShapeRefresh = false;
         previousByPosition.clear();
         chunkAvailability.clear();
@@ -682,18 +717,28 @@ public final class BlockShapeClient implements ClientModInitializer {
         );
     }
 
+    private static ArrayList<ShapeEntry> releaseCacheBuffer(ArrayList<ShapeEntry> buffer) {
+        if (buffer.size() > MAX_RETAINED_CACHE_ENTRIES) return new ArrayList<>();
+        buffer.clear();
+        return buffer;
+    }
+
     private static void invalidateCache() {
         cancelCacheBuild();
-        cachedShapes.clear();
+        cachedShapes = releaseCacheBuffer(cachedShapes);
         cachedChunkBuckets.clear();
+        pendingLightSections.clear();
+        outlineSubmitEntries.clear();
         lastReusedEntries = 0;
         lastRebuiltEntries = 0;
         lastScannedPositions = 0;
         lastRebuildMillis = 0.0;
         pendingFullShapeRefresh = true;
         pendingDirtyPositions.clear();
+        pendingShapeDirtyPositions.clear();
         buildFullShapeRefresh = true;
         buildDirtyPositions.clear();
+        buildShapeDirtyPositions.clear();
         cacheDirty = true;
         ticksSinceRefresh = refreshIntervalTicks;
     }
@@ -717,9 +762,12 @@ public final class BlockShapeClient implements ClientModInitializer {
             for (int offsetY = -1; offsetY <= 1; offsetY++) {
                 for (int offsetZ = -1; offsetZ <= 1; offsetZ++) {
                     for (int offsetX = -1; offsetX <= 1; offsetX++) {
-                        pendingDirtyPositions.add(changedPos.offset(offsetX, offsetY, offsetZ));
+                        BlockPos dirtyPos = changedPos.offset(offsetX, offsetY, offsetZ);
+                        pendingDirtyPositions.add(dirtyPos);
+                        pendingShapeDirtyPositions.add(dirtyPos);
                         if (pendingDirtyPositions.size() > 8192) {
                             pendingDirtyPositions.clear();
+                            pendingShapeDirtyPositions.clear();
                             pendingFullShapeRefresh = true;
                             break;
                         }
@@ -730,6 +778,65 @@ public final class BlockShapeClient implements ClientModInitializer {
             }
         }
         cacheDirty = true;
+    }
+
+    /** Called by the client chunk cache when a section's sky/block light data changes. */
+    public static void invalidateLightSection(SectionPos sectionPos) {
+        if (cachedLevel == null || cachedShapes.isEmpty()) return;
+        long key = sectionPos.asLong();
+        if (!pendingLightSections.contains(key) && pendingLightSections.size() >= 64) {
+            pendingLightSections.clear();
+            pendingFullShapeRefresh = true;
+            pendingDirtyPositions.clear();
+            pendingShapeDirtyPositions.clear();
+        } else {
+            pendingLightSections.add(key);
+        }
+        cacheDirty = true;
+    }
+
+    /** Coalesces light notifications and dirties only entries in the changed section and touching borders. */
+    private static void drainPendingLightSections() {
+        if (pendingLightSections.isEmpty()) return;
+        if (!pendingFullShapeRefresh) {
+            for (long packed : pendingLightSections) {
+                int sx = SectionPos.x(packed), sy = SectionPos.y(packed), sz = SectionPos.z(packed);
+                int minX = sx << 4, minY = sy << 4, minZ = sz << 4;
+                int maxX = minX + 15, maxY = minY + 15, maxZ = minZ + 15;
+                markLightSectionEntries(sx, sy, sz, -1, 0);
+                markLightSectionEntries(sx - 1, sy, sz, 0, minX - 1);
+                markLightSectionEntries(sx + 1, sy, sz, 0, maxX + 1);
+                markLightSectionEntries(sx, sy - 1, sz, 1, minY - 1);
+                markLightSectionEntries(sx, sy + 1, sz, 1, maxY + 1);
+                markLightSectionEntries(sx, sy, sz - 1, 2, minZ - 1);
+                markLightSectionEntries(sx, sy, sz + 1, 2, maxZ + 1);
+                if (pendingFullShapeRefresh) break;
+            }
+        }
+        pendingLightSections.clear();
+        cacheDirty = true;
+    }
+
+    /** axis=-1 marks a whole section; 0/1/2 mark only the touching X/Y/Z border. */
+    private static void markLightSectionEntries(int sx, int sy, int sz, int axis, int borderCoordinate) {
+        long key = (((long) sx & 0x3FFFFFFL) << 38)
+                | (((long) sz & 0x3FFFFFFL) << 12)
+                | (sy & 0xFFFL);
+        ShapeChunkBucket bucket = cachedChunkBuckets.get(key);
+        if (bucket == null) return;
+        for (ShapeEntry entry : bucket.entries()) {
+            BlockPos pos = entry.pos();
+            if (axis == 0 && pos.getX() != borderCoordinate) continue;
+            if (axis == 1 && pos.getY() != borderCoordinate) continue;
+            if (axis == 2 && pos.getZ() != borderCoordinate) continue;
+            pendingDirtyPositions.add(pos);
+            if (pendingDirtyPositions.size() > 8192) {
+                pendingDirtyPositions.clear();
+                pendingShapeDirtyPositions.clear();
+                pendingFullShapeRefresh = true;
+                return;
+            }
+        }
     }
 
     private static void invalidateChunkCache(net.minecraft.world.level.chunk.LevelChunk chunk) {
@@ -750,6 +857,7 @@ public final class BlockShapeClient implements ClientModInitializer {
         // A chunk may load while the first cache is still being built; use the job's
         // origin instead of the default/stale lastCacheOrigin in that case.
         pendingDirtyPositions.clear();
+        pendingShapeDirtyPositions.clear();
         pendingFullShapeRefresh = true;
         cacheDirty = true;
     }
@@ -941,7 +1049,25 @@ public final class BlockShapeClient implements ClientModInitializer {
     }
 
     private void submitShapes(LevelRenderContext context) {
-        if (!enabled || cachedShapes.isEmpty() || (!renderOutlines && !renderHiddenTextures)) return;
+        long renderStarted = System.nanoTime();
+        outlineSubmitEntries.clear();
+        int sectionsVisited = 0;
+        int sectionsCulled = 0;
+        int entriesVisited = 0;
+        int entriesCulled = 0;
+        int textureSubmissions = 0;
+
+        if (!enabled || cachedShapes.isEmpty() || (!renderOutlines && !renderHiddenTextures)) {
+            lastRenderSectionsVisited = 0;
+            lastRenderSectionsCulled = 0;
+            lastRenderEntriesVisited = 0;
+            lastRenderEntriesCulled = 0;
+            lastRenderTextureSubmissions = 0;
+            lastRenderOutlineEntries = 0;
+            lastRenderPreparationMillis = 0.0;
+            lastOutlineBatchMillis = 0.0;
+            return;
+        }
 
         Minecraft minecraft = Minecraft.getInstance();
         Level level = minecraft.level;
@@ -952,7 +1078,6 @@ public final class BlockShapeClient implements ClientModInitializer {
         int currentRadiusSquared = radius * radius;
         int currentTextureRadiusSquared = Math.min(radius, textureRadius);
         currentTextureRadiusSquared *= currentTextureRadiusSquared;
-
         var cameraState = context.levelState().cameraRenderState;
         Vec3 camera = cameraState.pos;
         var frustum = cameraState.cullFrustum;
@@ -960,68 +1085,94 @@ public final class BlockShapeClient implements ClientModInitializer {
         SubmitNodeCollector collector = context.submitNodeCollector();
 
         for (ShapeChunkBucket bucket : cachedChunkBuckets.values()) {
-            // Reject an entire section before visiting the cached blocks inside it.
-            if (frustum != null && !frustum.isVisible(bucket.bounds())) continue;
+            sectionsVisited++;
+            if (frustum != null && !frustum.isVisible(bucket.bounds())) {
+                sectionsCulled++;
+                continue;
+            }
             for (ShapeEntry entry : bucket.entries()) {
+                entriesVisited++;
                 int dx = entry.pos().getX() - currentOrigin.getX();
-            int dy = entry.pos().getY() - currentOrigin.getY();
-            int dz = entry.pos().getZ() - currentOrigin.getZ();
-            // The active cache may finish a progressive rebuild after the player moves.
-            // Never draw stale entries that have fallen outside the current configured area.
-            if (dx * dx + dz * dz > currentRadiusSquared
-                    || dy < -downRange || dy > upRange) continue;
+                int dy = entry.pos().getY() - currentOrigin.getY();
+                int dz = entry.pos().getZ() - currentOrigin.getZ();
+                if (dx * dx + dz * dz > currentRadiusSquared
+                        || dy < -downRange || dy > upRange) continue;
+                if (frustum != null && !frustum.isVisible(entry.bounds())) {
+                    entriesCulled++;
+                    continue;
+                }
 
-            // Cull blocks outside the camera view before creating submit nodes.
-            if (frustum != null && !frustum.isVisible(entry.bounds())) continue;
+                boolean withinTextureRadius = dx * dx + dz * dz <= currentTextureRadiusSquared;
+                boolean drawHiddenTexture = renderHiddenTextures
+                        && withinTextureRadius
+                        && entry.state().getRenderShape() == RenderShape.INVISIBLE
+                        && (entry.hiddenTextureMesh() != null || entry.specialHiddenTexture());
+                boolean drawOutline = renderOutlines && !entry.shape().isEmpty();
+                if (!drawHiddenTexture && !drawOutline) continue;
+                if (drawOutline) outlineSubmitEntries.add(entry);
 
-            boolean withinTextureRadius = dx * dx + dz * dz <= currentTextureRadiusSquared;
-            boolean drawHiddenTexture = renderHiddenTextures
-                    && withinTextureRadius
-                    && entry.state().getRenderShape() == RenderShape.INVISIBLE
-                    && (entry.hiddenTextureMesh() != null || entry.specialHiddenTexture());
-            boolean drawOutline = renderOutlines && !entry.shape().isEmpty();
-            if (!drawHiddenTexture && !drawOutline) continue;
-
-            poseStack.pushPose();
-            try {
-                poseStack.translate(
-                        entry.pos().getX() - camera.x,
-                        entry.pos().getY() - camera.y,
-                        entry.pos().getZ() - camera.z
-                );
-
-                // BlockHider marks world blocks INVISIBLE but keeps their baked models
-                // and the block texture atlas loaded. Submit those original models here.
-                // Normal visible blocks stay on the vanilla path, avoiding z-fighting.
                 if (drawHiddenTexture) {
+                    poseStack.pushPose();
                     try {
+                        poseStack.translate(
+                                entry.pos().getX() - camera.x,
+                                entry.pos().getY() - camera.y,
+                                entry.pos().getZ() - camera.z
+                        );
                         if (entry.hiddenTextureMesh() != null) {
                             submitCachedHiddenBlockTexture(entry, poseStack, collector);
                         } else {
                             submitSpecialHiddenBlockTexture(entry, poseStack, collector);
                         }
+                        textureSubmissions++;
                     } catch (RuntimeException exception) {
-                        // One broken third-party model must not break the whole world render.
                         logRenderFailure(entry.state(), exception);
+                    } finally {
+                        poseStack.popPose();
                     }
                 }
-
-                if (drawOutline) {
-                    collector.submitShapeOutline(
-                            poseStack,
-                            entry.shape(),
-                            RenderTypes.lines(),
-                            entry.color(),
-                            lineWidth,
-                            false
-                    );
-                }
-            } finally {
-                // Preserve the caller's pose even if a renderer or outline submission fails.
-                poseStack.popPose();
-            }
             }
         }
+
+        if (!outlineSubmitEntries.isEmpty()) {
+            poseStack.pushPose();
+            try {
+                poseStack.translate(-camera.x, -camera.y, -camera.z);
+                collector.submitCustomGeometry(poseStack, RenderTypes.lines(), (pose, buffer) -> {
+                    long batchStarted = System.nanoTime();
+                    for (ShapeEntry entry : outlineSubmitEntries) {
+                        int color = entry.color();
+                        float width = lineWidth;
+                        float baseX = entry.pos().getX();
+                        float baseY = entry.pos().getY();
+                        float baseZ = entry.pos().getZ();
+                        try {
+                            entry.shape().forAllEdges((x1, y1, z1, x2, y2, z2) -> {
+                                buffer.addVertex(pose, baseX + (float) x1, baseY + (float) y1, baseZ + (float) z1)
+                                        .setColor(color).setLineWidth(width).setNormal(pose, 0.0F, 1.0F, 0.0F);
+                                buffer.addVertex(pose, baseX + (float) x2, baseY + (float) y2, baseZ + (float) z2)
+                                        .setColor(color).setLineWidth(width).setNormal(pose, 0.0F, 1.0F, 0.0F);
+                            });
+                        } catch (RuntimeException exception) {
+                            logRenderFailure(entry.state(), exception);
+                        }
+                    }
+                    lastOutlineBatchMillis = (System.nanoTime() - batchStarted) / 1_000_000.0;
+                });
+            } finally {
+                poseStack.popPose();
+            }
+        } else {
+            lastOutlineBatchMillis = 0.0;
+        }
+
+        lastRenderSectionsVisited = sectionsVisited;
+        lastRenderSectionsCulled = sectionsCulled;
+        lastRenderEntriesVisited = entriesVisited;
+        lastRenderEntriesCulled = entriesCulled;
+        lastRenderTextureSubmissions = textureSubmissions;
+        lastRenderOutlineEntries = outlineSubmitEntries.size();
+        lastRenderPreparationMillis = (System.nanoTime() - renderStarted) / 1_000_000.0;
     }
 
     /**
@@ -1170,13 +1321,14 @@ public final class BlockShapeClient implements ClientModInitializer {
                                     + ", cache CPU time=" + Math.round(lastRebuildMillis * 100.0) / 100.0 + " ms"
                                     + ", adaptive work=" + Math.round(adaptiveBudgetScale * 100.0) + "%"
                                     + ", unique render errors=" + LOGGED_RENDER_ERRORS.size());
-                            feedback(context.getSource(), "Commands: /bshape on|off|toggle|inspect|refresh|reload|reset|block <namespace:id> <on|off>|namespace <name> <on|off>|quality performance|low|balanced|high|category <liquids|portals|fire|plants|special> <on|off>|outlines on|off|textures on|off|radius <2..32>|texture-radius <1..32|auto>|down <0..16>|up <0..16>|width <1..6>|color rainbow|color RRGGBB");
+                            feedback(context.getSource(), "Commands: /bshape on|off|toggle|inspect|profile|refresh|reload|reset|block <namespace:id> <on|off>|namespace <name> <on|off>|quality performance|low|balanced|high|category <liquids|portals|fire|plants|special> <on|off>|outlines on|off|textures on|off|radius <2..32>|texture-radius <1..32|auto>|down <0..16>|up <0..16>|width <1..6>|color rainbow|color RRGGBB");
                             return 1;
                         })
                         .then(ClientCommands.literal("on").executes(context -> setEnabled(context.getSource(), true)))
                         .then(ClientCommands.literal("off").executes(context -> setEnabled(context.getSource(), false)))
                         .then(ClientCommands.literal("toggle").executes(context -> setEnabled(context.getSource(), !enabled)))
                         .then(ClientCommands.literal("inspect").executes(context -> inspectTargetBlock(context.getSource())))
+                        .then(ClientCommands.literal("profile").executes(context -> showProfile(context.getSource())))
                         .then(ClientCommands.literal("refresh").executes(context -> {
                             invalidateCache();
                             feedback(context.getSource(), "Nearby block and texture cache will be rebuilt now");
@@ -1378,7 +1530,7 @@ public final class BlockShapeClient implements ClientModInitializer {
                 textureRadius = 3;
                 downRange = 1;
                 upRange = 1;
-                refreshIntervalTicks = 30;
+                refreshIntervalTicks = 1200;
                 scanBudgetPerTick = 1024;
                 textureBuildBudgetPerTick = 8;
             }
@@ -1387,7 +1539,7 @@ public final class BlockShapeClient implements ClientModInitializer {
                 textureRadius = 4;
                 downRange = 2;
                 upRange = 2;
-                refreshIntervalTicks = 20;
+                refreshIntervalTicks = 600;
                 scanBudgetPerTick = 2048;
                 textureBuildBudgetPerTick = 16;
             }
@@ -1396,7 +1548,7 @@ public final class BlockShapeClient implements ClientModInitializer {
                 textureRadius = 8;
                 downRange = 4;
                 upRange = 4;
-                refreshIntervalTicks = 5;
+                refreshIntervalTicks = 200;
                 scanBudgetPerTick = 8192;
                 textureBuildBudgetPerTick = 48;
             }
@@ -1405,7 +1557,7 @@ public final class BlockShapeClient implements ClientModInitializer {
                 textureRadius = 6;
                 downRange = 3;
                 upRange = 3;
-                refreshIntervalTicks = DEFAULT_REFRESH_INTERVAL_TICKS;
+                refreshIntervalTicks = 600;
                 scanBudgetPerTick = 4096;
                 textureBuildBudgetPerTick = 24;
             }
@@ -1526,6 +1678,28 @@ public final class BlockShapeClient implements ClientModInitializer {
         return 1;
     }
 
+    private static int showProfile(FabricClientCommandSource source) {
+        IdentityHashMap<Mesh, Boolean> uniqueMeshes = new IdentityHashMap<>();
+        for (ShapeEntry entry : cachedShapes) {
+            if (entry.hiddenTextureMesh() != null) uniqueMeshes.put(entry.hiddenTextureMesh(), Boolean.TRUE);
+        }
+        feedback(source, "Cache: entries=" + cachedShapes.size() + ", sections=" + cachedChunkBuckets.size()
+                + ", unique texture meshes=" + uniqueMeshes.size() + ", pending block changes=" + pendingDirtyPositions.size());
+        feedback(source, "Cache work: scanned=" + lastScannedPositions + ", reused=" + lastReusedEntries
+                + ", rebuilt=" + lastRebuiltEntries + ", build=" + Math.round(lastRebuildMillis * 100.0) / 100.0
+                + " ms, last slice=" + Math.round(lastSliceNanos / 1_000_000.0 * 100.0) / 100.0
+                + " ms, max slice=" + Math.round(maxSliceNanos / 1_000_000.0 * 100.0) / 100.0
+                + " ms, adaptive=" + Math.round(adaptiveBudgetScale * 100.0) + "%");
+        feedback(source, "Render prep=" + Math.round(lastRenderPreparationMillis * 100.0) / 100.0
+                + " ms, outline batch=" + Math.round(lastOutlineBatchMillis * 100.0) / 100.0
+                + " ms, sections=" + lastRenderSectionsVisited + " (culled " + lastRenderSectionsCulled + ")"
+                + ", entries=" + lastRenderEntriesVisited + " (culled " + lastRenderEntriesCulled + ")");
+        feedback(source, "Submissions: hidden textures=" + lastRenderTextureSubmissions
+                + ", batched outline entries=" + lastRenderOutlineEntries
+                + ", unique render errors=" + LOGGED_RENDER_ERRORS.size());
+        return 1;
+    }
+
     private static int setEnabled(FabricClientCommandSource source, boolean value) {
         enabled = value;
         invalidateCache();
@@ -1566,7 +1740,7 @@ public final class BlockShapeClient implements ClientModInitializer {
                 qualityPreset = "balanced";
             }
             applyQualityPreset(qualityPreset);
-            refreshIntervalTicks = clamp(parseInt(properties.getProperty("refreshIntervalTicks"), refreshIntervalTicks), 5, 40);
+            // Refresh cadence is preset-owned; ignore legacy 5..40 tick values from older configs.
             enabled = Boolean.parseBoolean(properties.getProperty("enabled", "true"));
             renderOutlines = Boolean.parseBoolean(properties.getProperty("renderOutlines", "true"));
             renderHiddenTextures = Boolean.parseBoolean(properties.getProperty("renderHiddenTextures", "true"));
