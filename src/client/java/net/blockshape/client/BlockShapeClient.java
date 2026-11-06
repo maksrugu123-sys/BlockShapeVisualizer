@@ -259,12 +259,26 @@ public final class BlockShapeClient implements ClientModInitializer {
     }
 
     private static void invalidateChunkCache(net.minecraft.world.level.chunk.LevelChunk chunk) {
-        int changedChunkX = chunk.getPos().x;
-        int changedChunkZ = chunk.getPos().z;
+        int minX = chunk.getPos().getMinBlockX();
+        int minZ = chunk.getPos().getMinBlockZ();
+        int maxX = minX + 15;
+        int maxZ = minZ + 15;
+
         if (!cachedShapes.isEmpty()) {
             cachedShapes = cachedShapes.stream()
-                    .filter(entry -> (entry.pos().getX() >> 4) != changedChunkX
-                            || (entry.pos().getZ() >> 4) != changedChunkZ)
+                    .filter(entry -> {
+                        int x = entry.pos().getX();
+                        int z = entry.pos().getZ();
+                        boolean insideChangedChunk = x >= minX && x <= maxX
+                                && z >= minZ && z <= maxZ;
+                        // Face culling for blocks directly across a chunk edge depends
+                        // on the neighbor chunk too, so invalidate this one-block border.
+                        boolean touchesChangedXEdge = (x == minX - 1 || x == maxX + 1)
+                                && z >= minZ && z <= maxZ;
+                        boolean touchesChangedZEdge = (z == minZ - 1 || z == maxZ + 1)
+                                && x >= minX && x <= maxX;
+                        return !insideChangedChunk && !touchesChangedXEdge && !touchesChangedZEdge;
+                    })
                     .toList();
         }
     }
