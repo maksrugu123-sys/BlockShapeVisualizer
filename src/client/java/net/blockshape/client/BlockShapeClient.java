@@ -205,9 +205,15 @@ public final class BlockShapeClient implements ClientModInitializer {
                     if (state.isAir()) continue;
 
                     BlockPos pos = cursor.immutable();
+                    // When BlockHider is installed, block entities that pass their
+                    // category filter are rendered by their real vanilla block-entity renderer.
+                    // Do not submit a second baked block model for the same position.
+                    boolean delegatedBlockEntity = FabricLoader.getInstance().isModLoaded("blockhider")
+                            && state.hasBlockEntity();
                     boolean hiddenTextureBlock = renderHiddenTextures
                             && state.getRenderShape() == RenderShape.INVISIBLE
-                            && shouldRestoreHiddenTextureCategory(state);
+                            && shouldRestoreHiddenTextureCategory(state)
+                            && !delegatedBlockEntity;
 
                     VoxelShape shape = net.minecraft.world.phys.shapes.Shapes.empty();
                     if (renderOutlines) {
@@ -806,14 +812,18 @@ public final class BlockShapeClient implements ClientModInitializer {
         }
 
         String category = textureCategoryName(state, specialModel);
+        boolean delegatedBlockEntity = FabricLoader.getInstance().isModLoaded("blockhider")
+                && state.hasBlockEntity();
         boolean restorationEnabled = renderHiddenTextures
                 && shouldRestoreHiddenTextureCategory(state)
-                && (!specialModel || shouldRestoreSpecialModelCategory(state));
+                && (!specialModel || shouldRestoreSpecialModelCategory(state))
+                && !delegatedBlockEntity;
         ShapeEntry cached = cachedShapes.stream()
                 .filter(entry -> entry.pos().equals(pos))
                 .findFirst()
                 .orElse(null);
-        String cacheState = cached == null ? "not cached"
+        String cacheState = delegatedBlockEntity ? "delegated to BlockHider / vanilla block-entity renderer"
+                : cached == null ? "not cached"
                 : cached.hiddenTextureMesh() != null ? "mesh cached"
                 : cached.specialHiddenTexture() ? "special fallback"
                 : "shape only";
