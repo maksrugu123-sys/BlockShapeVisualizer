@@ -545,6 +545,7 @@ public final class BlockShapeClient implements ClientModInitializer {
                             feedback(context.getSource(), "Nearby block and texture cache will be rebuilt now");
                             return 1;
                         }))
+                        .then(ClientCommands.literal("reset").executes(context -> resetSettings(context.getSource())))
                         .then(ClientCommands.literal("quality")
                                 .then(ClientCommands.literal("low").executes(context -> setQuality(context.getSource(), "low")))
                                 .then(ClientCommands.literal("balanced").executes(context -> setQuality(context.getSource(), "balanced")))
@@ -679,6 +680,29 @@ public final class BlockShapeClient implements ClientModInitializer {
                 refreshIntervalTicks = DEFAULT_REFRESH_INTERVAL_TICKS;
             }
         }
+    }
+
+    private static int resetSettings(FabricClientCommandSource source) {
+        enabled = true;
+        renderOutlines = true;
+        renderHiddenTextures = true;
+        categoryLiquids = true;
+        categoryPortals = true;
+        categoryFire = true;
+        categoryPlants = true;
+        categorySpecialModels = true;
+        radius = 6;
+        downRange = 3;
+        upRange = 3;
+        lineWidth = 2.0f;
+        perBlockColors = true;
+        fixedColor = 0xFF35D7FF;
+        qualityPreset = "balanced";
+        applyQualityPreset(qualityPreset);
+        invalidateCache();
+        saveConfig();
+        feedback(source, "All BlockShape settings restored to defaults");
+        return 1;
     }
 
     private static int setEnabled(FabricClientCommandSource source, boolean value) {
