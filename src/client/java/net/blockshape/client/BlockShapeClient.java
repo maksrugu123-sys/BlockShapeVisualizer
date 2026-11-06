@@ -79,13 +79,18 @@ import org.slf4j.LoggerFactory;
 /** Client-only block collision-shape visualizer for Minecraft 26.3. */
 public final class BlockShapeClient implements ClientModInitializer {
     private static final int MIN_RADIUS = 2;
-    private static final int MAX_RADIUS = 16;
+    private static final int MAX_RADIUS = 32;
+    private static final int MIN_TEXTURE_RADIUS = 1;
+    private static final int MAX_TEXTURE_RADIUS = 32;
+    private static final int DEFAULT_TEXTURE_RADIUS = 16;
     private static final int MIN_VERTICAL_RANGE = 0;
     private static final int MAX_VERTICAL_RANGE = 16;
-    // The balanced profile rebuilds twice per second; other profiles trade detail for speed.
     private static final int DEFAULT_REFRESH_INTERVAL_TICKS = 10;
     private static final int MOVEMENT_REFRESH_DISTANCE_SQUARED = 4;
+    private static final int MIN_EVENT_REFRESH_INTERVAL_TICKS = 3;
     private static int refreshIntervalTicks = DEFAULT_REFRESH_INTERVAL_TICKS;
+    private static int scanBudgetPerTick = 4096;
+    private static int textureBuildBudgetPerTick = 24;
     private static final int[] EMPTY_QUAD_INDICES = new int[0];
     private static final Logger LOGGER = LoggerFactory.getLogger("blockshape");
     private static final int MAX_LOGGED_RENDER_ERRORS = 128;
@@ -113,6 +118,8 @@ public final class BlockShapeClient implements ClientModInitializer {
     private static boolean categoryPlants = true;
     private static boolean categorySpecialModels = true;
     private static int radius = 6;
+    // The outer radius can show outlines; texture restoration has its own smaller LOD radius.
+    private static int textureRadius = DEFAULT_TEXTURE_RADIUS;
     private static int downRange = 3;
     private static int upRange = 3;
     private static float lineWidth = 2.0f;
@@ -124,9 +131,18 @@ public final class BlockShapeClient implements ClientModInitializer {
     private static ClientLevel cachedLevel;
     private static boolean blockHiderApiResolved;
     private static Method blockHiderShouldShowBlockEntity;
-    private static List<ShapeEntry> cachedShapes = List.of();
+    // Two alternating buffers and reusable indexes reduce temporary allocation/GC
+    // during repeated cache rebuilds, especially on mobile devices.
+    private static List<ShapeEntry> cachedShapes = new ArrayList<>();
+    private static List<ShapeEntry> cacheBuildEntries = new ArrayList<>();
+    private static final Map<BlockPos, ShapeEntry> previousByPosition = new HashMap<>();
+    private static final Map<Long, Boolean> chunkAvailability = new HashMap<>();
+    private static CacheBuildJob cacheBuildJob;
+    private static boolean cacheDirty = true;
     private static int lastReusedEntries;
     private static int lastRebuiltEntries;
+    private static int lastScannedPositions;
+    private static double lastRebuildMillis;
 
     private record NeighborSnapshot(BlockState state, int packedLight) {}
 
@@ -156,13 +172,61 @@ public final class BlockShapeClient implements ClientModInitializer {
 
     private record CachedTexture(Mesh mesh, boolean translucent, boolean specialModel) {}
 
+    /** A cache build is spread across several client ticks to avoid one-frame spikes. */
+    private static final class CacheBuildJob {
+        private final ClientLevel level;
+        private final Player player;
+        private final BlockPos origin;
+        private final int radius;
+        private final int textureRadius;
+        private final int radiusSquared;
+        private final int textureRadiusSquared;
+        private final int down;
+        private final int up;
+        private final boolean ambientOcclusion;
+        private final CollisionContext collisionContext;
+        private final BlockPos.MutableBlockPos cursor = new BlockPos.MutableBlockPos();
+        private int x;
+        private int y;
+        private int z;
+        private int reusedEntries;
+        private int rebuiltEntries;
+        private int scannedPositions;
+        private long cpuNanos;
+        private boolean complete;
+
+        private CacheBuildJob(
+                ClientLevel level,
+                Player player,
+                BlockPos origin,
+                int radius,
+                int textureRadius,
+                int down,
+                int up,
+                boolean ambientOcclusion
+        ) {
+            this.level = level;
+            this.player = player;
+            this.origin = origin;
+            this.radius = radius;
+            this.textureRadius = Math.min(radius, textureRadius);
+            this.radiusSquared = radius * radius;
+            this.textureRadiusSquared = this.textureRadius * this.textureRadius;
+            this.down = down;
+            this.up = up;
+            this.ambientOcclusion = ambientOcclusion;
+            this.collisionContext = CollisionContext.of(player);
+            this.x = -radius;
+            this.y = -down;
+            this.z = -radius;
+        }
+    }
+
     @Override
     public void onInitializeClient() {
         loadConfig();
         registerResourceReloadListener();
 
-        // Invalidate only entries belonging to the changed chunk. The regular
-        // quality interval then rebuilds nearby meshes without clearing the whole view.
         ClientChunkEvents.CHUNK_LOAD.register((world, chunk) -> invalidateChunkCache(chunk));
         ClientChunkEvents.CHUNK_UNLOAD.register((world, chunk) -> invalidateChunkCache(chunk));
 
@@ -173,9 +237,12 @@ public final class BlockShapeClient implements ClientModInitializer {
                 return;
             }
             if (!enabled) {
-                cachedShapes = List.of();
+                cancelCacheBuild();
+                cachedShapes.clear();
+                cacheBuildEntries.clear();
                 lastReusedEntries = 0;
                 lastRebuiltEntries = 0;
+                lastScannedPositions = 0;
                 ticksSinceRefresh = refreshIntervalTicks;
                 return;
             }
@@ -183,18 +250,37 @@ public final class BlockShapeClient implements ClientModInitializer {
                 cachedLevel = client.level;
                 invalidateCache();
             }
+
             boolean ambientOcclusion = client.options.ambientOcclusion().get();
+            if (cacheBuildJob != null) {
+                if (cacheBuildJob.level != client.level
+                        || cacheBuildJob.ambientOcclusion != ambientOcclusion) {
+                    cancelCacheBuild();
+                    cacheDirty = true;
+                } else {
+                    continueCacheBuild();
+                    if (cacheBuildJob != null) return;
+                }
+            }
+
             BlockPos currentOrigin = client.player.blockPosition();
             long moveX = (long) currentOrigin.getX() - lastCacheOrigin.getX();
             long moveY = (long) currentOrigin.getY() - lastCacheOrigin.getY();
             long moveZ = (long) currentOrigin.getZ() - lastCacheOrigin.getZ();
             boolean playerMovedEnough = moveX * moveX + moveY * moveY + moveZ * moveZ
                     >= MOVEMENT_REFRESH_DISTANCE_SQUARED;
+
+            ticksSinceRefresh++;
+            boolean eventRefreshDue = cacheDirty
+                    && ticksSinceRefresh >= MIN_EVENT_REFRESH_INTERVAL_TICKS;
             if (playerMovedEnough
-                    || ++ticksSinceRefresh >= refreshIntervalTicks
+                    || ticksSinceRefresh >= refreshIntervalTicks
+                    || eventRefreshDue
                     || cachedAmbientOcclusion != ambientOcclusion) {
+                cacheDirty = false;
                 ticksSinceRefresh = 0;
-                rebuildCache(client.level, client.player);
+                beginCacheBuild(client.level, client.player);
+                continueCacheBuild();
             }
         });
 
@@ -202,114 +288,163 @@ public final class BlockShapeClient implements ClientModInitializer {
         registerCommands();
     }
 
-    private static void rebuildCache(ClientLevel level, Player player) {
-        cachedAmbientOcclusion = Minecraft.getInstance().options.ambientOcclusion().get();
-        int r = radius;
-        int down = downRange;
-        int up = upRange;
-        BlockPos origin = player.blockPosition();
-        lastCacheOrigin = origin.immutable();
-        if (!renderOutlines && !renderHiddenTextures) {
-            cachedShapes = List.of();
-            lastReusedEntries = 0;
-            lastRebuiltEntries = 0;
-            return;
-        }
-
-        BlockPos.MutableBlockPos cursor = new BlockPos.MutableBlockPos();
-        CollisionContext collisionContext = CollisionContext.of(player);
-        int radiusSquared = r * r;
-        int verticalSpan = down + up + 1;
-        int expectedEntries = Math.max(16, (int) (Math.PI * radiusSquared * verticalSpan));
-        List<ShapeEntry> result = new ArrayList<>(expectedEntries);
-        Map<Long, Boolean> chunkAvailability = new HashMap<>();
-        int reusedEntries = 0;
-        int rebuiltEntries = 0;
-        Map<BlockPos, ShapeEntry> previousByPosition = new HashMap<>(cachedShapes.size());
+    private static void beginCacheBuild(ClientLevel level, Player player) {
+        cacheBuildEntries.clear();
+        previousByPosition.clear();
         for (ShapeEntry previous : cachedShapes) {
             previousByPosition.put(previous.pos(), previous);
         }
+        chunkAvailability.clear();
 
-        // Check each chunk only once instead of asking Level for every block position.
-        for (int y = -down; y <= up; y++) {
-            for (int z = -r; z <= r; z++) {
-                for (int x = -r; x <= r; x++) {
-                    if (x * x + z * z > radiusSquared) continue;
-                    cursor.set(origin.getX() + x, origin.getY() + y, origin.getZ() + z);
+        boolean ambientOcclusion = Minecraft.getInstance().options.ambientOcclusion().get();
+        cacheBuildJob = new CacheBuildJob(
+                level,
+                player,
+                player.blockPosition().immutable(),
+                radius,
+                textureRadius,
+                downRange,
+                upRange,
+                ambientOcclusion
+        );
+        int verticalSpan = downRange + upRange + 1;
+        int expectedEntries = Math.max(16, (int) (Math.PI * radius * radius * verticalSpan));
+        if (cacheBuildEntries instanceof ArrayList<ShapeEntry> result) {
+            result.ensureCapacity(Math.min(expectedEntries, 120_000));
+        }
+    }
 
-                    if (!isChunkLoaded(level, cursor, chunkAvailability)) continue;
+    private static void continueCacheBuild() {
+        CacheBuildJob job = cacheBuildJob;
+        if (job == null) return;
 
-                    BlockState state = level.getBlockState(cursor);
-                    if (state.isAir()) continue;
+        long passStarted = System.nanoTime();
+        int positionsRemaining = scanBudgetPerTick;
+        int textureBuildsRemaining = textureBuildBudgetPerTick;
 
-                    BlockPos pos = cursor.immutable();
-                    // If BlockHider passes this block through, its render shape is not
-                    // INVISIBLE and the vanilla renderer owns it. If BlockHider hides it,
-                    // allow the Special Models category to try the baked-model fallback.
-                    boolean hiddenTextureBlock = renderHiddenTextures
-                            && state.getRenderShape() == RenderShape.INVISIBLE
-                            && shouldRestoreHiddenTextureCategory(state)
-                            && !isBlockEntityRenderedByBlockHider(state);
+        while (positionsRemaining > 0 && !job.complete) {
+            int x = job.x;
+            int y = job.y;
+            int z = job.z;
 
-                    VoxelShape shape = net.minecraft.world.phys.shapes.Shapes.empty();
-                    if (renderOutlines) {
-                        // Snow's selection shape matches the visible layer height, while its
-                        // collision shape is shorter (and the first layer has no collision).
-                        if (state.getBlock() instanceof SnowLayerBlock) {
-                            shape = state.getShape(level, cursor, collisionContext);
-                        } else {
-                            shape = state.getCollisionShape(level, cursor, collisionContext);
-                            // Non-collidable decorations can still have a useful selection shape.
-                            if (shape.isEmpty()) {
-                                shape = state.getShape(level, cursor, collisionContext);
+            if (x * x + z * z <= job.radiusSquared) {
+                job.cursor.set(
+                        job.origin.getX() + x,
+                        job.origin.getY() + y,
+                        job.origin.getZ() + z
+                );
+
+                if (isChunkLoaded(job.level, job.cursor, chunkAvailability)) {
+                    BlockState state = job.level.getBlockState(job.cursor);
+                    if (!state.isAir()) {
+                        BlockPos pos = job.cursor.immutable();
+                        boolean hiddenTextureBlock = renderHiddenTextures
+                                && x * x + z * z <= job.textureRadiusSquared
+                                && state.getRenderShape() == RenderShape.INVISIBLE
+                                && shouldRestoreHiddenTextureCategory(state)
+                                && !isBlockEntityRenderedByBlockHider(state);
+
+                        VoxelShape shape = net.minecraft.world.phys.shapes.Shapes.empty();
+                        if (renderOutlines) {
+                            if (state.getBlock() instanceof SnowLayerBlock) {
+                                shape = state.getShape(job.level, job.cursor, job.collisionContext);
+                            } else {
+                                shape = state.getCollisionShape(job.level, job.cursor, job.collisionContext);
+                                if (shape.isEmpty()) {
+                                    shape = state.getShape(job.level, job.cursor, job.collisionContext);
+                                }
                             }
                         }
-                    }
 
-                    if (shape.isEmpty() && !hiddenTextureBlock) continue;
+                        if (!shape.isEmpty() || hiddenTextureBlock) {
+                            int color = renderOutlines
+                                    ? (perBlockColors ? colorForBlock(state) : fixedColor)
+                                    : fixedColor;
+                            TextureCacheKey textureCacheKey = hiddenTextureBlock
+                                    ? createTextureCacheKey(
+                                            job.level, pos, state, chunkAvailability, job.ambientOcclusion
+                                    )
+                                    : null;
+                            Mesh textureMesh = null;
+                            boolean translucentTexture = false;
+                            boolean specialTexture = false;
 
-                    int color = renderOutlines
-                            ? (perBlockColors ? colorForBlock(state) : fixedColor)
-                            : fixedColor;
-                    TextureCacheKey textureCacheKey = hiddenTextureBlock
-                            ? createTextureCacheKey(level, pos, state, chunkAvailability)
-                            : null;
-                    Mesh textureMesh = null;
-                    boolean translucentTexture = false;
-                    boolean specialTexture = false;
-                    if (hiddenTextureBlock) {
-                        ShapeEntry previous = previousByPosition.get(pos);
-                        if (previous != null && textureCacheKey.equals(previous.textureCacheKey())) {
-                            // Reuse an immutable mesh when block state, neighbors, biome and light are unchanged.
-                            textureMesh = previous.hiddenTextureMesh();
-                            translucentTexture = previous.translucentHiddenTexture();
-                            specialTexture = previous.specialHiddenTexture();
-                            reusedEntries++;
-                        } else {
-                            rebuiltEntries++;
-                            CachedTexture texture;
-                            try {
-                                texture = buildHiddenTextureMesh(level, pos, state);
-                            } catch (RuntimeException exception) {
-                                logRenderFailure(state, exception);
-                                // Try the vanilla display-state path for a model the world tessellator rejects.
-                                texture = new CachedTexture(null, false, true);
+                            if (hiddenTextureBlock) {
+                                ShapeEntry previous = previousByPosition.get(pos);
+                                if (previous != null && textureCacheKey.equals(previous.textureCacheKey())) {
+                                    textureMesh = previous.hiddenTextureMesh();
+                                    translucentTexture = previous.translucentHiddenTexture();
+                                    specialTexture = previous.specialHiddenTexture();
+                                    job.reusedEntries++;
+                                } else {
+                                    // Pause before an expensive model build when this tick's budget is used.
+                                    if (textureBuildsRemaining <= 0) break;
+                                    textureBuildsRemaining--;
+                                    job.rebuiltEntries++;
+                                    CachedTexture texture;
+                                    try {
+                                        texture = buildHiddenTextureMesh(job.level, pos, state);
+                                    } catch (RuntimeException exception) {
+                                        logRenderFailure(state, exception);
+                                        texture = new CachedTexture(null, false, true);
+                                    }
+                                    textureMesh = texture.mesh();
+                                    translucentTexture = texture.translucent();
+                                    specialTexture = texture.specialModel();
+                                }
                             }
-                            textureMesh = texture.mesh();
-                            translucentTexture = texture.translucent();
-                            specialTexture = texture.specialModel();
+
+                            cacheBuildEntries.add(new ShapeEntry(
+                                    pos, state, shape, color, textureCacheKey,
+                                    textureMesh, translucentTexture, specialTexture
+                            ));
                         }
                     }
-                    result.add(new ShapeEntry(
-                            pos, state, shape, color, textureCacheKey,
-                            textureMesh, translucentTexture, specialTexture
-                    ));
                 }
             }
+
+            job.scannedPositions++;
+            positionsRemaining--;
+            advanceCacheBuildPosition(job);
         }
-        cachedShapes = List.copyOf(result);
-        lastReusedEntries = reusedEntries;
-        lastRebuiltEntries = rebuiltEntries;
+
+        job.cpuNanos += System.nanoTime() - passStarted;
+        if (job.complete) {
+            List<ShapeEntry> previousBuffer = cachedShapes;
+            cachedShapes = cacheBuildEntries;
+            cacheBuildEntries = previousBuffer;
+            lastCacheOrigin = job.origin;
+            cachedAmbientOcclusion = job.ambientOcclusion;
+            lastReusedEntries = job.reusedEntries;
+            lastRebuiltEntries = job.rebuiltEntries;
+            lastScannedPositions = job.scannedPositions;
+            lastRebuildMillis = job.cpuNanos / 1_000_000.0;
+            cacheBuildJob = null;
+            previousByPosition.clear();
+            chunkAvailability.clear();
+        }
+    }
+
+    private static void advanceCacheBuildPosition(CacheBuildJob job) {
+        job.x++;
+        if (job.x > job.radius) {
+            job.x = -job.radius;
+            job.z++;
+        }
+        if (job.z > job.radius) {
+            job.z = -job.radius;
+            job.y++;
+        }
+        if (job.y > job.up) {
+            job.complete = true;
+        }
+    }
+
+    private static void cancelCacheBuild() {
+        cacheBuildJob = null;
+        cacheBuildEntries.clear();
+        previousByPosition.clear();
+        chunkAvailability.clear();
     }
 
     private static void registerResourceReloadListener() {
@@ -365,7 +500,8 @@ public final class BlockShapeClient implements ClientModInitializer {
             ClientLevel level,
             BlockPos pos,
             BlockState state,
-            Map<Long, Boolean> chunkAvailability
+            Map<Long, Boolean> chunkAvailability,
+            boolean ambientOcclusion
     ) {
         return new TextureCacheKey(
                 state,
@@ -377,37 +513,32 @@ public final class BlockShapeClient implements ClientModInitializer {
                 snapshotNeighbor(level, pos.below(), chunkAvailability),
                 LightCoordsUtil.getLightCoords(level, pos),
                 level.getBiome(pos),
-                cachedAmbientOcclusion
+                ambientOcclusion
         );
     }
 
     private static void invalidateCache() {
-        cachedShapes = List.of();
+        cancelCacheBuild();
+        cachedShapes.clear();
         lastReusedEntries = 0;
         lastRebuiltEntries = 0;
+        lastScannedPositions = 0;
+        lastRebuildMillis = 0.0;
+        cacheDirty = true;
         ticksSinceRefresh = refreshIntervalTicks;
     }
 
-    /**
-     * Invalidate the changed block and its surrounding 3x3x3 neighborhood.
-     * Neighboring model meshes may use face culling or connected-model data
-     * derived from the changed position. The normal refresh interval is bypassed
-     * once so the nearby cache is rebuilt on the next client tick.
-     */
+    /** Queue block changes for one coalesced cache refresh instead of rebuilding per event. */
     public static void invalidateBlockAndNeighbors(BlockPos changedPos) {
         if (cachedLevel == null) return;
         long dx = (long) changedPos.getX() - lastCacheOrigin.getX();
         long dy = (long) changedPos.getY() - lastCacheOrigin.getY();
         long dz = (long) changedPos.getZ() - lastCacheOrigin.getZ();
-        if (dx * dx + dz * dz > (radius + 1) * (radius + 1)
+        if (dx * dx + dz * dz > (radius + 1L) * (radius + 1L)
                 || dy < -downRange - 1 || dy > upRange + 1) {
             return;
         }
-
-        // The complete nearby cache is rebuilt on the next client tick.
-        // Batch block changes instead of filtering/copying the same list for every
-        // setBlock call, which can happen hundreds of times during chunk updates.
-        ticksSinceRefresh = refreshIntervalTicks;
+        cacheDirty = true;
     }
 
     private static void invalidateChunkCache(net.minecraft.world.level.chunk.LevelChunk chunk) {
@@ -416,16 +547,13 @@ public final class BlockShapeClient implements ClientModInitializer {
         int minZ = chunk.getPos().getMinBlockZ();
         int maxX = minX + 15;
         int maxZ = minZ + 15;
-
         int nearestX = Math.max(minX, Math.min(maxX, lastCacheOrigin.getX()));
         int nearestZ = Math.max(minZ, Math.min(maxZ, lastCacheOrigin.getZ()));
         long dx = (long) nearestX - lastCacheOrigin.getX();
         long dz = (long) nearestZ - lastCacheOrigin.getZ();
         long activeRadius = (long) radius + 1L;
         if (dx * dx + dz * dz > activeRadius * activeRadius) return;
-
-        // Chunk load/unload events are coalesced into the same next-tick rebuild.
-        ticksSinceRefresh = refreshIntervalTicks;
+        cacheDirty = true;
     }
 
     private static void logRenderFailure(BlockState state, RuntimeException exception) {
@@ -756,7 +884,8 @@ public final class BlockShapeClient implements ClientModInitializer {
                 dispatcher.register(ClientCommands.literal("bshape")
                         .executes(context -> {
                             feedback(context.getSource(), "BlockShape: " + (enabled ? "ON" : "OFF")
-                                    + ", radius=" + radius + ", down=" + downRange + ", up=" + upRange + ", width=" + lineWidth
+                                    + ", radius=" + radius + ", textureRadius=" + textureRadius
+                                    + ", down=" + downRange + ", up=" + upRange + ", width=" + lineWidth
                                     + ", quality=" + qualityPreset
                                     + ", categories=" + (categoryLiquids ? "L" : "-")
                                     + (categoryPortals ? "P" : "-")
@@ -767,8 +896,12 @@ public final class BlockShapeClient implements ClientModInitializer {
                                     + ", colors=" + (perBlockColors ? "per-block" : "fixed")
                                     + ", hidden textures=" + (renderHiddenTextures ? "ON" : "OFF"));
                             feedback(context.getSource(), "Категории L/P/F/G/M = жидкости/порталы/огонь/растения/спецмодели; ON означает обработку категории.");
-                            feedback(context.getSource(), "Cached entries=" + cachedShapes.size() + ", texture cache entries reused=" + lastReusedEntries + ", rebuilt=" + lastRebuiltEntries + ", unique render errors=" + LOGGED_RENDER_ERRORS.size());
-                            feedback(context.getSource(), "Commands: /bshape on|off|toggle|inspect|refresh|reload|reset|block <namespace:id> <on|off>|namespace <name> <on|off>|quality performance|low|balanced|high|category <liquids|portals|fire|plants|special> <on|off>|outlines on|off|textures on|off|radius <2..16>|down <0..16>|up <0..16>|width <1..6>|color rainbow|color RRGGBB");
+                            feedback(context.getSource(), "Cached entries=" + cachedShapes.size()
+                                    + ", reused=" + lastReusedEntries + ", rebuilt=" + lastRebuiltEntries
+                                    + ", scanned=" + lastScannedPositions
+                                    + ", cache CPU time=" + Math.round(lastRebuildMillis * 100.0) / 100.0 + " ms"
+                                    + ", unique render errors=" + LOGGED_RENDER_ERRORS.size());
+                            feedback(context.getSource(), "Commands: /bshape on|off|toggle|inspect|refresh|reload|reset|block <namespace:id> <on|off>|namespace <name> <on|off>|quality performance|low|balanced|high|category <liquids|portals|fire|plants|special> <on|off>|outlines on|off|textures on|off|radius <2..32>|texture-radius <1..32|auto>|down <0..16>|up <0..16>|width <1..6>|color rainbow|color RRGGBB");
                             return 1;
                         })
                         .then(ClientCommands.literal("on").executes(context -> setEnabled(context.getSource(), true)))
@@ -822,17 +955,34 @@ public final class BlockShapeClient implements ClientModInitializer {
                         .then(ClientCommands.literal("radius").then(ClientCommands.argument("blocks", IntegerArgumentType.integer(MIN_RADIUS, MAX_RADIUS))
                                 .executes(context -> {
                                     radius = IntegerArgumentType.getInteger(context, "blocks");
+                                    if (textureRadius > radius) textureRadius = radius;
                                     qualityPreset = "custom";
-                                    ticksSinceRefresh = refreshIntervalTicks;
+                                    invalidateCache();
                                     saveConfig();
-                                    feedback(context.getSource(), "Display radius: " + radius + " blocks");
+                                    feedback(context.getSource(), "Outline/display radius: " + radius + " blocks");
                                     return 1;
                                 })))
+                        .then(ClientCommands.literal("texture-radius")
+                                .then(ClientCommands.literal("auto").executes(context -> {
+                                    textureRadius = Math.min(radius, DEFAULT_TEXTURE_RADIUS);
+                                    invalidateCache();
+                                    saveConfig();
+                                    feedback(context.getSource(), "Texture restoration radius: " + textureRadius + " blocks (automatic LOD)");
+                                    return 1;
+                                }))
+                                .then(ClientCommands.argument("blocks", IntegerArgumentType.integer(MIN_TEXTURE_RADIUS, MAX_TEXTURE_RADIUS))
+                                        .executes(context -> {
+                                            textureRadius = IntegerArgumentType.getInteger(context, "blocks");
+                                            invalidateCache();
+                                            saveConfig();
+                                            feedback(context.getSource(), "Texture restoration radius: " + textureRadius + " blocks");
+                                            return 1;
+                                        })))
                         .then(ClientCommands.literal("down").then(ClientCommands.argument("blocks", IntegerArgumentType.integer(MIN_VERTICAL_RANGE, MAX_VERTICAL_RANGE))
                                 .executes(context -> {
                                     downRange = IntegerArgumentType.getInteger(context, "blocks");
                                     qualityPreset = "custom";
-                                    ticksSinceRefresh = refreshIntervalTicks;
+                                    invalidateCache();
                                     saveConfig();
                                     feedback(context.getSource(), "Visible range below player: " + downRange + " blocks");
                                     return 1;
@@ -841,7 +991,7 @@ public final class BlockShapeClient implements ClientModInitializer {
                                 .executes(context -> {
                                     upRange = IntegerArgumentType.getInteger(context, "blocks");
                                     qualityPreset = "custom";
-                                    ticksSinceRefresh = refreshIntervalTicks;
+                                    invalidateCache();
                                     saveConfig();
                                     feedback(context.getSource(), "Visible range above player: " + upRange + " blocks");
                                     return 1;
@@ -953,27 +1103,39 @@ public final class BlockShapeClient implements ClientModInitializer {
             case "performance" -> {
                 // Aggressive mobile profile: small scan volume and infrequent rebuilds.
                 radius = 3;
+                textureRadius = 3;
                 downRange = 1;
                 upRange = 1;
                 refreshIntervalTicks = 30;
+                scanBudgetPerTick = 1024;
+                textureBuildBudgetPerTick = 8;
             }
             case "low" -> {
                 radius = 4;
+                textureRadius = 4;
                 downRange = 2;
                 upRange = 2;
                 refreshIntervalTicks = 20;
+                scanBudgetPerTick = 2048;
+                textureBuildBudgetPerTick = 16;
             }
             case "high" -> {
                 radius = 8;
+                textureRadius = 8;
                 downRange = 4;
                 upRange = 4;
                 refreshIntervalTicks = 5;
+                scanBudgetPerTick = 8192;
+                textureBuildBudgetPerTick = 48;
             }
             case "balanced" -> {
                 radius = 6;
+                textureRadius = 6;
                 downRange = 3;
                 upRange = 3;
                 refreshIntervalTicks = DEFAULT_REFRESH_INTERVAL_TICKS;
+                scanBudgetPerTick = 4096;
+                textureBuildBudgetPerTick = 24;
             }
             default -> {
                 qualityPreset = "custom";
@@ -1077,6 +1239,7 @@ public final class BlockShapeClient implements ClientModInitializer {
         DISABLED_TEXTURE_BLOCK_IDS.clear();
         DISABLED_TEXTURE_NAMESPACES.clear();
         radius = 6;
+        textureRadius = 6;
         downRange = 3;
         upRange = 3;
         lineWidth = 2.0f;
@@ -1092,7 +1255,7 @@ public final class BlockShapeClient implements ClientModInitializer {
 
     private static int setEnabled(FabricClientCommandSource source, boolean value) {
         enabled = value;
-        ticksSinceRefresh = refreshIntervalTicks;
+        invalidateCache();
         saveConfig();
         feedback(source, "BlockShape " + (enabled ? "enabled" : "disabled"));
         return 1;
@@ -1100,7 +1263,7 @@ public final class BlockShapeClient implements ClientModInitializer {
 
     private static int setOutlines(FabricClientCommandSource source, boolean value) {
         renderOutlines = value;
-        ticksSinceRefresh = refreshIntervalTicks;
+        invalidateCache();
         saveConfig();
         feedback(source, "Block outlines: " + (renderOutlines ? "enabled" : "disabled"));
         return 1;
@@ -1108,7 +1271,7 @@ public final class BlockShapeClient implements ClientModInitializer {
 
     private static int setHiddenTextures(FabricClientCommandSource source, boolean value) {
         renderHiddenTextures = value;
-        ticksSinceRefresh = refreshIntervalTicks;
+        invalidateCache();
         saveConfig();
         feedback(source, "Hidden block textures: " + (renderHiddenTextures ? "enabled" : "disabled"));
         return 1;
@@ -1150,6 +1313,12 @@ public final class BlockShapeClient implements ClientModInitializer {
                 if (namespace.matches("[a-z0-9_.-]+")) DISABLED_TEXTURE_NAMESPACES.add(namespace);
             }
             radius = clamp(parseInt(properties.getProperty("radius"), 6), MIN_RADIUS, MAX_RADIUS);
+            textureRadius = clamp(
+                    parseInt(properties.getProperty("textureRadius"), Math.min(radius, DEFAULT_TEXTURE_RADIUS)),
+                    MIN_TEXTURE_RADIUS,
+                    MAX_TEXTURE_RADIUS
+            );
+            textureRadius = Math.min(textureRadius, radius);
             downRange = clamp(parseInt(properties.getProperty("downRange"), 3), MIN_VERTICAL_RANGE, MAX_VERTICAL_RANGE);
             upRange = clamp(parseInt(properties.getProperty("upRange"), 3), MIN_VERTICAL_RANGE, MAX_VERTICAL_RANGE);
             lineWidth = Math.max(1.0f, Math.min(6.0f, parseFloat(properties.getProperty("lineWidth"), 2.0f)));
@@ -1176,6 +1345,7 @@ public final class BlockShapeClient implements ClientModInitializer {
         properties.setProperty("disabledTextureBlockIds", String.join(",", DISABLED_TEXTURE_BLOCK_IDS));
         properties.setProperty("disabledTextureNamespaces", String.join(",", DISABLED_TEXTURE_NAMESPACES));
         properties.setProperty("radius", Integer.toString(radius));
+        properties.setProperty("textureRadius", Integer.toString(textureRadius));
         properties.setProperty("downRange", Integer.toString(downRange));
         properties.setProperty("upRange", Integer.toString(upRange));
         properties.setProperty("lineWidth", Float.toString(lineWidth));
