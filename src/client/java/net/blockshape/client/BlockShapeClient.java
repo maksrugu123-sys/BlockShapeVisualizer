@@ -37,6 +37,7 @@ import net.minecraft.server.packs.resources.ResourceManagerReloadListener;
 import net.minecraft.client.resources.model.geometry.BakedQuad;
 import net.minecraft.util.LightCoordsUtil;
 import net.minecraft.util.RandomSource;
+import net.minecraft.world.entity.Pose;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Block;
@@ -143,6 +144,12 @@ public final class BlockShapeClient implements ClientModInitializer {
     private static final Map<BlockPos, ShapeEntry> previousByPosition = new HashMap<>();
     private static final Map<Long, Boolean> chunkAvailability = new HashMap<>();
     private static final Map<Long, Boolean> nonEmptySectionCache = new HashMap<>();
+    // Event-driven dirty positions are deduplicated and consumed by the next cache job.
+    private static Set<BlockPos> pendingDirtyPositions = new HashSet<>();
+    private static Set<BlockPos> buildDirtyPositions = new HashSet<>();
+    private static boolean pendingFullShapeRefresh = true;
+    private static boolean buildFullShapeRefresh = true;
+    private static Pose cachedPlayerPose;
     private static CacheBuildJob cacheBuildJob;
     private static boolean cacheDirty = true;
     private static int lastReusedEntries;
@@ -191,6 +198,9 @@ public final class BlockShapeClient implements ClientModInitializer {
         private final int down;
         private final int up;
         private final boolean ambientOcclusion;
+        private final Pose playerPose;
+        private final boolean fullShapeRefresh;
+        private final Set<BlockPos> dirtyPositions;
         private final CollisionContext collisionContext;
         private final BlockPos.MutableBlockPos cursor = new BlockPos.MutableBlockPos();
         private int x;
@@ -210,7 +220,10 @@ public final class BlockShapeClient implements ClientModInitializer {
                 int textureRadius,
                 int down,
                 int up,
-                boolean ambientOcclusion
+                boolean ambientOcclusion,
+                Pose playerPose,
+                boolean fullShapeRefresh,
+                Set<BlockPos> dirtyPositions
         ) {
             this.level = level;
             this.player = player;
@@ -222,6 +235,9 @@ public final class BlockShapeClient implements ClientModInitializer {
             this.down = down;
             this.up = up;
             this.ambientOcclusion = ambientOcclusion;
+            this.playerPose = playerPose;
+            this.fullShapeRefresh = fullShapeRefresh;
+            this.dirtyPositions = dirtyPositions;
             this.collisionContext = CollisionContext.of(player);
             this.x = -radius;
             this.y = -down;
@@ -261,7 +277,8 @@ public final class BlockShapeClient implements ClientModInitializer {
             boolean ambientOcclusion = client.options.ambientOcclusion().get();
             if (cacheBuildJob != null) {
                 if (cacheBuildJob.level != client.level
-                        || cacheBuildJob.ambientOcclusion != ambientOcclusion) {
+                        || cacheBuildJob.ambientOcclusion != ambientOcclusion
+                        || cacheBuildJob.playerPose != client.player.getPose()) {
                     cancelCacheBuild();
                     cacheDirty = true;
                 } else {
@@ -283,7 +300,8 @@ public final class BlockShapeClient implements ClientModInitializer {
             if (playerMovedEnough
                     || ticksSinceRefresh >= refreshIntervalTicks
                     || eventRefreshDue
-                    || cachedAmbientOcclusion != ambientOcclusion) {
+                    || cachedAmbientOcclusion != ambientOcclusion
+                    || cachedPlayerPose != client.player.getPose()) {
                 cacheDirty = false;
                 ticksSinceRefresh = 0;
                 beginCacheBuild(client.level, client.player);
@@ -304,6 +322,13 @@ public final class BlockShapeClient implements ClientModInitializer {
         chunkAvailability.clear();
         nonEmptySectionCache.clear();
 
+        Set<BlockPos> previousDirtyBuffer = buildDirtyPositions;
+        buildDirtyPositions = pendingDirtyPositions;
+        pendingDirtyPositions = previousDirtyBuffer;
+        pendingDirtyPositions.clear();
+        buildFullShapeRefresh = pendingFullShapeRefresh;
+        pendingFullShapeRefresh = false;
+
         boolean ambientOcclusion = Minecraft.getInstance().options.ambientOcclusion().get();
         cacheBuildJob = new CacheBuildJob(
                 level,
@@ -313,7 +338,10 @@ public final class BlockShapeClient implements ClientModInitializer {
                 textureRadius,
                 downRange,
                 upRange,
-                ambientOcclusion
+                ambientOcclusion,
+                player.getPose(),
+                buildFullShapeRefresh,
+                buildDirtyPositions
         );
         int verticalSpan = downRange + upRange + 1;
         int expectedEntries = Math.max(16, (int) (Math.PI * radius * radius * verticalSpan));
@@ -351,9 +379,18 @@ public final class BlockShapeClient implements ClientModInitializer {
                                 && shouldRestoreHiddenTextureCategory(state)
                                 && !isBlockEntityRenderedByBlockHider(state);
 
+                        ShapeEntry previous = previousByPosition.get(pos);
+                        boolean reuseShape = previous != null
+                                && previous.state() == state
+                                && !job.fullShapeRefresh
+                                && job.playerPose == cachedPlayerPose
+                                && !job.dirtyPositions.contains(pos);
+
                         VoxelShape shape = net.minecraft.world.phys.shapes.Shapes.empty();
                         if (renderOutlines) {
-                            if (state.getBlock() instanceof SnowLayerBlock) {
+                            if (reuseShape) {
+                                shape = previous.shape();
+                            } else if (state.getBlock() instanceof SnowLayerBlock) {
                                 shape = state.getShape(job.level, job.cursor, job.collisionContext);
                             } else {
                                 shape = state.getCollisionShape(job.level, job.cursor, job.collisionContext);
@@ -365,7 +402,9 @@ public final class BlockShapeClient implements ClientModInitializer {
 
                         if (!shape.isEmpty() || hiddenTextureBlock) {
                             int color = renderOutlines
-                                    ? (perBlockColors ? colorForBlock(state) : fixedColor)
+                                    ? (perBlockColors
+                                            ? (reuseShape ? previous.color() : colorForBlock(state))
+                                            : fixedColor)
                                     : fixedColor;
                             TextureCacheKey textureCacheKey = hiddenTextureBlock
                                     ? createTextureCacheKey(
@@ -401,7 +440,7 @@ public final class BlockShapeClient implements ClientModInitializer {
                                 }
                             }
 
-                            AABB bounds = new AABB(
+                            AABB bounds = reuseShape ? previous.bounds() : new AABB(
                                     pos.getX() - 0.25,
                                     pos.getY() - 0.25,
                                     pos.getZ() - 0.25,
@@ -437,6 +476,9 @@ public final class BlockShapeClient implements ClientModInitializer {
             cacheBuildEntries = previousBuffer;
             lastCacheOrigin = job.origin;
             cachedAmbientOcclusion = job.ambientOcclusion;
+            cachedPlayerPose = job.playerPose;
+            buildDirtyPositions.clear();
+            buildFullShapeRefresh = false;
             lastReusedEntries = job.reusedEntries;
             lastRebuiltEntries = job.rebuiltEntries;
             lastScannedPositions = job.scannedPositions;
@@ -464,8 +506,15 @@ public final class BlockShapeClient implements ClientModInitializer {
     }
 
     private static void cancelCacheBuild() {
+        if (buildFullShapeRefresh) {
+            pendingFullShapeRefresh = true;
+        } else if (!buildDirtyPositions.isEmpty()) {
+            pendingDirtyPositions.addAll(buildDirtyPositions);
+        }
         cacheBuildJob = null;
         cacheBuildEntries.clear();
+        buildDirtyPositions.clear();
+        buildFullShapeRefresh = false;
         previousByPosition.clear();
         chunkAvailability.clear();
         nonEmptySectionCache.clear();
@@ -578,19 +627,44 @@ public final class BlockShapeClient implements ClientModInitializer {
         lastRebuiltEntries = 0;
         lastScannedPositions = 0;
         lastRebuildMillis = 0.0;
+        pendingFullShapeRefresh = true;
+        pendingDirtyPositions.clear();
+        buildFullShapeRefresh = true;
+        buildDirtyPositions.clear();
         cacheDirty = true;
         ticksSinceRefresh = refreshIntervalTicks;
     }
 
     /** Queue block changes for one coalesced cache refresh instead of rebuilding per event. */
     public static void invalidateBlockAndNeighbors(BlockPos changedPos) {
-        if (cachedLevel == null) return;
-        long dx = (long) changedPos.getX() - lastCacheOrigin.getX();
-        long dy = (long) changedPos.getY() - lastCacheOrigin.getY();
-        long dz = (long) changedPos.getZ() - lastCacheOrigin.getZ();
-        if (dx * dx + dz * dz > (radius + 1L) * (radius + 1L)
-                || dy < -downRange - 1 || dy > upRange + 1) {
+        if (cachedLevel == null && cacheBuildJob == null) return;
+        BlockPos center = cacheBuildJob != null ? cacheBuildJob.origin : lastCacheOrigin;
+        int activeRadius = cacheBuildJob != null ? cacheBuildJob.radius : radius;
+        int activeDown = cacheBuildJob != null ? cacheBuildJob.down : downRange;
+        int activeUp = cacheBuildJob != null ? cacheBuildJob.up : upRange;
+        long dx = (long) changedPos.getX() - center.getX();
+        long dy = (long) changedPos.getY() - center.getY();
+        long dz = (long) changedPos.getZ() - center.getZ();
+        if (dx * dx + dz * dz > (activeRadius + 1L) * (activeRadius + 1L)
+                || dy < -activeDown - 1 || dy > activeUp + 1) {
             return;
+        }
+
+        if (!pendingFullShapeRefresh) {
+            for (int offsetY = -1; offsetY <= 1; offsetY++) {
+                for (int offsetZ = -1; offsetZ <= 1; offsetZ++) {
+                    for (int offsetX = -1; offsetX <= 1; offsetX++) {
+                        pendingDirtyPositions.add(changedPos.offset(offsetX, offsetY, offsetZ));
+                        if (pendingDirtyPositions.size() > 8192) {
+                            pendingDirtyPositions.clear();
+                            pendingFullShapeRefresh = true;
+                            break;
+                        }
+                    }
+                    if (pendingFullShapeRefresh) break;
+                }
+                if (pendingFullShapeRefresh) break;
+            }
         }
         cacheDirty = true;
     }
@@ -607,6 +681,8 @@ public final class BlockShapeClient implements ClientModInitializer {
         long dz = (long) nearestZ - lastCacheOrigin.getZ();
         long activeRadius = (long) radius + 1L;
         if (dx * dx + dz * dz > activeRadius * activeRadius) return;
+        pendingDirtyPositions.clear();
+        pendingFullShapeRefresh = true;
         cacheDirty = true;
     }
 
@@ -1068,6 +1144,7 @@ public final class BlockShapeClient implements ClientModInitializer {
                                     String value = StringArgumentType.getString(context, "value");
                                     if (value.equalsIgnoreCase("rainbow")) {
                                         perBlockColors = true;
+                                        invalidateCache();
                                         saveConfig();
                                         feedback(context.getSource(), "Each block type now has its own stable color");
                                         return 1;
@@ -1079,6 +1156,7 @@ public final class BlockShapeClient implements ClientModInitializer {
                                     }
                                     fixedColor = 0xFF000000 | Integer.parseInt(hex, 16);
                                     perBlockColors = false;
+                                    invalidateCache();
                                     saveConfig();
                                     feedback(context.getSource(), "All block outlines color: #" + hex.toUpperCase());
                                     return 1;
