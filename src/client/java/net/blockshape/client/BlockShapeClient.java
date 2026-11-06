@@ -1004,10 +1004,8 @@ public final class BlockShapeClient implements ClientModInitializer {
         }
 
         String category = textureCategoryName(state, specialModel);
-        boolean restorationEnabled = renderHiddenTextures
-                && shouldRestoreHiddenTextureCategory(state)
-                && (!specialModel || shouldRestoreSpecialModelCategory(state))
-                && !isBlockEntityRenderedByBlockHider(state);
+        String restorationStatus = getTextureRestorationStatus(state, specialModel);
+        boolean restorationEnabled = restorationStatus.startsWith("ready");
         ShapeEntry cached = cachedShapes.stream()
                 .filter(entry -> entry.pos().equals(pos))
                 .findFirst()
@@ -1026,8 +1024,33 @@ public final class BlockShapeClient implements ClientModInitializer {
                 + " | Model: " + modelType));
         source.sendFeedback(Component.literal("[BlockShape] Texture restore: "
                 + (restorationEnabled ? "enabled" : "disabled")
-                + " | Cache: " + cacheState));
+                + " (" + restorationStatus + ") | Cache: " + cacheState));
         return 1;
+    }
+
+    private static String getTextureRestorationStatus(BlockState state, boolean specialModel) {
+        if (!enabled) return "BlockShape disabled";
+        if (!renderHiddenTextures) return "texture drawing disabled";
+        if (state.getRenderShape() != RenderShape.INVISIBLE) return "vanilla render path";
+        String blockId = BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
+        if (DISABLED_TEXTURE_BLOCK_IDS.contains(blockId)) return "excluded by block ID";
+        int separator = blockId.indexOf(':');
+        String namespace = separator > 0 ? blockId.substring(0, separator) : "minecraft";
+        if (DISABLED_TEXTURE_NAMESPACES.contains(namespace)) return "excluded by namespace";
+        if (state.getBlock() instanceof net.minecraft.world.level.block.LiquidBlock && !categoryLiquids) {
+            return "Liquids category OFF";
+        }
+        if ((state.is(Blocks.END_PORTAL) || state.is(BlockTags.PORTALS) || state.is(Blocks.END_GATEWAY))
+                && !categoryPortals) return "Portals category OFF";
+        if ((state.is(BlockTags.FIRE) || state.is(BlockTags.CAMPFIRES)) && !categoryFire) {
+            return "Fire category OFF";
+        }
+        if (isPlantBlock(state) && !categoryPlants) return "Plants category OFF";
+        if ((state.hasBlockEntity() || specialModel) && !shouldRestoreSpecialModelCategory(state)) {
+            return "Special Models category OFF";
+        }
+        if (isBlockEntityRenderedByBlockHider(state)) return "native BlockHider renderer";
+        return "ready in active radius";
     }
 
     private static String textureCategoryName(BlockState state, boolean specialModel) {
