@@ -306,6 +306,19 @@ public final class BlockShapeClient implements ClientModInitializer {
         return true;
     }
 
+    private static boolean shouldRestoreSpecialModelCategory(BlockState state) {
+        String blockId = BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
+        if (DISABLED_TEXTURE_BLOCK_IDS.contains(blockId)) return false;
+        int namespaceSeparator = blockId.indexOf(':');
+        String namespace = namespaceSeparator > 0 ? blockId.substring(0, namespaceSeparator) : "minecraft";
+        if (DISABLED_TEXTURE_NAMESPACES.contains(namespace)) return false;
+        if (state.getBlock() instanceof net.minecraft.world.level.block.LiquidBlock) return categoryLiquids;
+        if (state.is(Blocks.END_PORTAL) || state.is(BlockTags.PORTALS) || state.is(Blocks.END_GATEWAY)) return categoryPortals;
+        if (state.is(BlockTags.FIRE) || state.is(BlockTags.CAMPFIRES)) return categoryFire;
+        if (isPlantBlock(state)) return categoryPlants;
+        return categorySpecialModels;
+    }
+
     private static boolean isPlantBlock(BlockState state) {
         if (state.getBlock() instanceof net.minecraft.world.level.block.LiquidBlock) return false;
         return state.getBlock() instanceof BushBlock
@@ -460,7 +473,9 @@ public final class BlockShapeClient implements ClientModInitializer {
 
         // Keep vanilla's special display path for chests, heads, bells, portals, etc.
         if (!(displayModel instanceof BlockStateModelWrapper)) {
-            return new CachedTexture(null, false, categorySpecialModels);
+            // Dedicated categories (portals, fire, plants, liquids) control their own
+            // special renderers; only otherwise-unclassified models use Special Models.
+            return new CachedTexture(null, false, shouldRestoreSpecialModelCategory(state));
         }
 
         BlockStateModel model = minecraft.getModelManager()
@@ -790,7 +805,7 @@ public final class BlockShapeClient implements ClientModInitializer {
         String category = textureCategoryName(state, specialModel);
         boolean restorationEnabled = renderHiddenTextures
                 && shouldRestoreHiddenTextureCategory(state)
-                && (!specialModel || categorySpecialModels);
+                && (!specialModel || shouldRestoreSpecialModelCategory(state));
         ShapeEntry cached = cachedShapes.stream()
                 .filter(entry -> entry.pos().equals(pos))
                 .findFirst()
