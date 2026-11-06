@@ -12,6 +12,7 @@ import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientChunkEvents;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.rendering.v1.level.LevelRenderEvents;
 import net.fabricmc.fabric.api.client.rendering.v1.level.LevelRenderContext;
+import net.fabricmc.fabric.api.resource.v1.ResourceLoader;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
@@ -28,6 +29,10 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.tags.BlockTags;
 import net.minecraft.network.chat.Component;
+import net.minecraft.resources.Identifier;
+import net.minecraft.server.packs.PackType;
+import net.minecraft.server.packs.resources.ResourceManager;
+import net.minecraft.server.packs.resources.ResourceManagerReloadListener;
 import net.minecraft.client.resources.model.geometry.BakedQuad;
 import net.minecraft.util.LightCoordsUtil;
 import net.minecraft.util.RandomSource;
@@ -130,6 +135,7 @@ public final class BlockShapeClient implements ClientModInitializer {
     @Override
     public void onInitializeClient() {
         loadConfig();
+        registerResourceReloadListener();
 
         // Invalidate only entries belonging to the changed chunk. The regular
         // quality interval then rebuilds nearby meshes without clearing the whole view.
@@ -259,6 +265,26 @@ public final class BlockShapeClient implements ClientModInitializer {
             }
         }
         cachedShapes = List.copyOf(result);
+    }
+
+    private static void registerResourceReloadListener() {
+        ResourceLoader.get(PackType.CLIENT_RESOURCES).registerReloadListener(
+                Identifier.fromNamespaceAndPath("blockshape", "texture_cache_invalidator"),
+                new ResourceManagerReloadListener() {
+                    @Override
+                    public void onResourceManagerReload(ResourceManager resourceManager) {
+                        // Cached meshes reference baked models and atlas sprites. They must
+                        // never survive a resource-pack reload or F3+T.
+                        invalidateCache();
+                        hiddenTextureMesh = null;
+                        hiddenTextureRenderer = null;
+                        hiddenTextureRendererInitialized = false;
+                        SPECIAL_MODEL_RENDER_STATE.clear();
+                        LOGGED_RENDER_ERRORS.clear();
+                        LOGGER.debug("Resource reload invalidated BlockShape texture meshes.");
+                    }
+                }
+        );
     }
 
     private static void invalidateCache() {
