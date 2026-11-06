@@ -473,6 +473,9 @@ public final class BlockShapeClient implements ClientModInitializer {
             ArrayList<ShapeEntry> previousBuffer = cachedShapes;
             cachedShapes = cacheBuildEntries;
             cacheBuildEntries = previousBuffer;
+            // Drop stale entry/mesh references immediately; the new active cache
+            // already retains every mesh that is still reusable.
+            cacheBuildEntries.clear();
             lastCacheOrigin = job.origin;
             cachedAmbientOcclusion = job.ambientOcclusion;
             cachedPlayerPose = job.playerPose;
@@ -830,8 +833,15 @@ public final class BlockShapeClient implements ClientModInitializer {
     private void submitShapes(LevelRenderContext context) {
         if (!enabled || cachedShapes.isEmpty()) return;
 
-        Level level = Minecraft.getInstance().level;
-        if (level == null) return;
+        Minecraft minecraft = Minecraft.getInstance();
+        Level level = minecraft.level;
+        Player player = minecraft.player;
+        if (level == null || player == null) return;
+
+        BlockPos currentOrigin = player.blockPosition();
+        int currentRadiusSquared = radius * radius;
+        int currentTextureRadiusSquared = Math.min(radius, textureRadius);
+        currentTextureRadiusSquared *= currentTextureRadiusSquared;
 
         var cameraState = context.levelState().cameraRenderState;
         Vec3 camera = cameraState.pos;
@@ -840,10 +850,20 @@ public final class BlockShapeClient implements ClientModInitializer {
         SubmitNodeCollector collector = context.submitNodeCollector();
 
         for (ShapeEntry entry : cachedShapes) {
+            int dx = entry.pos().getX() - currentOrigin.getX();
+            int dy = entry.pos().getY() - currentOrigin.getY();
+            int dz = entry.pos().getZ() - currentOrigin.getZ();
+            // The active cache may finish a progressive rebuild after the player moves.
+            // Never draw stale entries that have fallen outside the current configured area.
+            if (dx * dx + dz * dz > currentRadiusSquared
+                    || dy < -downRange || dy > upRange) continue;
+
             // Cull blocks outside the camera view before creating submit nodes.
             if (frustum != null && !frustum.isVisible(entry.bounds())) continue;
 
+            boolean withinTextureRadius = dx * dx + dz * dz <= currentTextureRadiusSquared;
             boolean drawHiddenTexture = renderHiddenTextures
+                    && withinTextureRadius
                     && entry.state().getRenderShape() == RenderShape.INVISIBLE
                     && (entry.hiddenTextureMesh() != null || entry.specialHiddenTexture());
             boolean drawOutline = renderOutlines && !entry.shape().isEmpty();
