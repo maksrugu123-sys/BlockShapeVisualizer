@@ -9,6 +9,7 @@ on:
       - fix/render-performance-cache
       - feat/outlines-snow-performance
       - feat/static-fluids-portals
+      - feat/mobile-render-cache-hardening
 
 jobs:
   build:
