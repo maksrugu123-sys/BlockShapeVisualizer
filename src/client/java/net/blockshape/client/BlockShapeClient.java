@@ -713,17 +713,22 @@ public final class BlockShapeClient implements ClientModInitializer {
     }
 
     private static void invalidateChunkCache(net.minecraft.world.level.chunk.LevelChunk chunk) {
-        if (cachedLevel == null) return;
+        if (cachedLevel == null && cacheBuildJob == null) return;
+        BlockPos center = cacheBuildJob != null ? cacheBuildJob.origin : lastCacheOrigin;
+        int activeRadius = cacheBuildJob != null ? cacheBuildJob.radius : radius;
         int minX = chunk.getPos().getMinBlockX();
         int minZ = chunk.getPos().getMinBlockZ();
         int maxX = minX + 15;
         int maxZ = minZ + 15;
-        int nearestX = Math.max(minX, Math.min(maxX, lastCacheOrigin.getX()));
-        int nearestZ = Math.max(minZ, Math.min(maxZ, lastCacheOrigin.getZ()));
-        long dx = (long) nearestX - lastCacheOrigin.getX();
-        long dz = (long) nearestZ - lastCacheOrigin.getZ();
-        long activeRadius = (long) radius + 1L;
-        if (dx * dx + dz * dz > activeRadius * activeRadius) return;
+        int nearestX = Math.max(minX, Math.min(maxX, center.getX()));
+        int nearestZ = Math.max(minZ, Math.min(maxZ, center.getZ()));
+        long dx = (long) nearestX - center.getX();
+        long dz = (long) nearestZ - center.getZ();
+        long activeRadiusSquared = (long) activeRadius + 1L;
+        if (dx * dx + dz * dz > activeRadiusSquared * activeRadiusSquared) return;
+
+        // A chunk may load while the first cache is still being built; use the job's
+        // origin instead of the default/stale lastCacheOrigin in that case.
         pendingDirtyPositions.clear();
         pendingFullShapeRefresh = true;
         cacheDirty = true;
