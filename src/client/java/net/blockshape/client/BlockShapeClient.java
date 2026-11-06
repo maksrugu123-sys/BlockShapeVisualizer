@@ -200,6 +200,8 @@ public final class BlockShapeClient implements ClientModInitializer {
         lastCacheOrigin = origin.immutable();
         if (!renderOutlines && !renderHiddenTextures) {
             cachedShapes = List.of();
+            lastReusedMeshes = 0;
+            lastRebuiltMeshes = 0;
             return;
         }
 
@@ -369,6 +371,8 @@ public final class BlockShapeClient implements ClientModInitializer {
 
     private static void invalidateCache() {
         cachedShapes = List.of();
+        lastReusedMeshes = 0;
+        lastRebuiltMeshes = 0;
         ticksSinceRefresh = refreshIntervalTicks;
     }
 
