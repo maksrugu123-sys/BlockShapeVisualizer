@@ -120,8 +120,10 @@ public final class BlockShapeClient implements ClientModInitializer {
     public void onInitializeClient() {
         loadConfig();
 
-        ClientChunkEvents.CHUNK_LOAD.register((world, chunk) -> invalidateCache());
-        ClientChunkEvents.CHUNK_UNLOAD.register((world, chunk) -> invalidateCache());
+        // Chunk streams can emit several events in one tick. Drop stale data now,
+        // but let the selected quality interval throttle the expensive rebuild.
+        ClientChunkEvents.CHUNK_LOAD.register((world, chunk) -> markCacheStale());
+        ClientChunkEvents.CHUNK_UNLOAD.register((world, chunk) -> markCacheStale());
 
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             if (client.level == null || client.player == null) {
@@ -131,7 +133,7 @@ public final class BlockShapeClient implements ClientModInitializer {
             }
             if (!enabled) {
                 cachedShapes = List.of();
-                ticksSinceRefresh = refreshIntervalTicks
+                ticksSinceRefresh = refreshIntervalTicks;
                 return;
             }
             if (cachedLevel != client.level) {
@@ -243,7 +245,11 @@ public final class BlockShapeClient implements ClientModInitializer {
 
     private static void invalidateCache() {
         cachedShapes = List.of();
-        ticksSinceRefresh = refreshIntervalTicks
+        ticksSinceRefresh = refreshIntervalTicks;
+    }
+
+    private static void markCacheStale() {
+        cachedShapes = List.of();
     }
 
     private static void logRenderFailure(BlockState state, RuntimeException exception) {
@@ -491,7 +497,7 @@ public final class BlockShapeClient implements ClientModInitializer {
                                 .executes(context -> {
                                     radius = IntegerArgumentType.getInteger(context, "blocks");
                                     qualityPreset = "custom";
-                                    ticksSinceRefresh = refreshIntervalTicks
+                                    ticksSinceRefresh = refreshIntervalTicks;
                                     saveConfig();
                                     feedback(context.getSource(), "Display radius: " + radius + " blocks");
                                     return 1;
@@ -500,7 +506,7 @@ public final class BlockShapeClient implements ClientModInitializer {
                                 .executes(context -> {
                                     downRange = IntegerArgumentType.getInteger(context, "blocks");
                                     qualityPreset = "custom";
-                                    ticksSinceRefresh = refreshIntervalTicks
+                                    ticksSinceRefresh = refreshIntervalTicks;
                                     saveConfig();
                                     feedback(context.getSource(), "Visible range below player: " + downRange + " blocks");
                                     return 1;
@@ -509,7 +515,7 @@ public final class BlockShapeClient implements ClientModInitializer {
                                 .executes(context -> {
                                     upRange = IntegerArgumentType.getInteger(context, "blocks");
                                     qualityPreset = "custom";
-                                    ticksSinceRefresh = refreshIntervalTicks
+                                    ticksSinceRefresh = refreshIntervalTicks;
                                     saveConfig();
                                     feedback(context.getSource(), "Visible range above player: " + upRange + " blocks");
                                     return 1;
@@ -585,7 +591,7 @@ public final class BlockShapeClient implements ClientModInitializer {
 
     private static int setEnabled(FabricClientCommandSource source, boolean value) {
         enabled = value;
-        ticksSinceRefresh = refreshIntervalTicks
+        ticksSinceRefresh = refreshIntervalTicks;
         saveConfig();
         feedback(source, "BlockShape " + (enabled ? "enabled" : "disabled"));
         return 1;
@@ -593,7 +599,7 @@ public final class BlockShapeClient implements ClientModInitializer {
 
     private static int setOutlines(FabricClientCommandSource source, boolean value) {
         renderOutlines = value;
-        ticksSinceRefresh = refreshIntervalTicks
+        ticksSinceRefresh = refreshIntervalTicks;
         saveConfig();
         feedback(source, "Block outlines: " + (renderOutlines ? "enabled" : "disabled"));
         return 1;
@@ -601,7 +607,7 @@ public final class BlockShapeClient implements ClientModInitializer {
 
     private static int setHiddenTextures(FabricClientCommandSource source, boolean value) {
         renderHiddenTextures = value;
-        ticksSinceRefresh = refreshIntervalTicks
+        ticksSinceRefresh = refreshIntervalTicks;
         saveConfig();
         feedback(source, "Hidden block textures: " + (renderHiddenTextures ? "enabled" : "disabled"));
         return 1;
