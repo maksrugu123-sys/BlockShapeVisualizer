@@ -387,13 +387,22 @@ public final class BlockShapeClient implements ClientModInitializer {
      * once so the nearby cache is rebuilt on the next client tick.
      */
     public static void invalidateBlockAndNeighbors(BlockPos changedPos) {
+        if (cachedLevel == null) return;
+        int dx = changedPos.getX() - lastCacheOrigin.getX();
+        int dy = changedPos.getY() - lastCacheOrigin.getY();
+        int dz = changedPos.getZ() - lastCacheOrigin.getZ();
+        if (dx * dx + dz * dz > (radius + 1) * (radius + 1)
+                || dy < -downRange - 1 || dy > upRange + 1) {
+            return;
+        }
+
+        int minX = changedPos.getX() - 1;
+        int maxX = changedPos.getX() + 1;
+        int minY = changedPos.getY() - 1;
+        int maxY = changedPos.getY() + 1;
+        int minZ = changedPos.getZ() - 1;
+        int maxZ = changedPos.getZ() + 1;
         if (!cachedShapes.isEmpty()) {
-            int minX = changedPos.getX() - 1;
-            int maxX = changedPos.getX() + 1;
-            int minY = changedPos.getY() - 1;
-            int maxY = changedPos.getY() + 1;
-            int minZ = changedPos.getZ() - 1;
-            int maxZ = changedPos.getZ() + 1;
             cachedShapes = cachedShapes.stream()
                     .filter(entry -> {
                         BlockPos pos = entry.pos();
@@ -403,14 +412,24 @@ public final class BlockShapeClient implements ClientModInitializer {
                     })
                     .toList();
         }
+        // Includes newly placed blocks that were air and therefore had no old cache entry.
         ticksSinceRefresh = refreshIntervalTicks;
     }
 
     private static void invalidateChunkCache(net.minecraft.world.level.chunk.LevelChunk chunk) {
+        if (cachedLevel == null) return;
         int minX = chunk.getPos().getMinBlockX();
         int minZ = chunk.getPos().getMinBlockZ();
         int maxX = minX + 15;
         int maxZ = minZ + 15;
+
+        // Only chunks intersecting the active search circle can affect this cache.
+        int nearestX = Math.max(minX, Math.min(maxX, lastCacheOrigin.getX()));
+        int nearestZ = Math.max(minZ, Math.min(maxZ, lastCacheOrigin.getZ()));
+        int dx = nearestX - lastCacheOrigin.getX();
+        int dz = nearestZ - lastCacheOrigin.getZ();
+        int activeRadius = radius + 1;
+        if (dx * dx + dz * dz > activeRadius * activeRadius) return;
 
         if (!cachedShapes.isEmpty()) {
             cachedShapes = cachedShapes.stream()
@@ -429,6 +448,7 @@ public final class BlockShapeClient implements ClientModInitializer {
                     })
                     .toList();
         }
+        // Also rebuild when the chunk enters the active area for the first time.
         ticksSinceRefresh = refreshIntervalTicks;
     }
 
