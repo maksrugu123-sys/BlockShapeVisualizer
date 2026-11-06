@@ -8,6 +8,7 @@ import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommands;
 import net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientChunkEvents;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.rendering.v1.level.LevelRenderEvents;
 import net.fabricmc.fabric.api.client.rendering.v1.level.LevelRenderContext;
@@ -57,6 +58,11 @@ import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.HashSet;
+import java.util.Set;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /** Client-only block collision-shape visualizer for Minecraft 26.3. */
 public final class BlockShapeClient implements ClientModInitializer {
@@ -67,6 +73,9 @@ public final class BlockShapeClient implements ClientModInitializer {
     // Rebuild at most twice per second while standing still; movement is handled immediately.
     private static final int REFRESH_INTERVAL_TICKS = 10;
     private static final int[] EMPTY_QUAD_INDICES = new int[0];
+    private static final Logger LOGGER = LoggerFactory.getLogger("blockshape");
+    private static final int MAX_LOGGED_RENDER_ERRORS = 128;
+    private static final Set<String> LOGGED_RENDER_ERRORS = new HashSet<>();
     private static final Map<Block, Integer> BLOCK_COLOR_CACHE = new IdentityHashMap<>();
     private static final Path CONFIG_FILE = FabricLoader.getInstance().getConfigDir()
             .resolve("blockshape-visualizer.properties");
@@ -90,6 +99,7 @@ public final class BlockShapeClient implements ClientModInitializer {
     private static int fixedColor = 0xFF35D7FF;
     private static int ticksSinceRefresh = REFRESH_INTERVAL_TICKS;
     private static BlockPos lastCacheOrigin = BlockPos.ZERO;
+    private static ClientLevel cachedLevel;
     private static List<ShapeEntry> cachedShapes = List.of();
 
     private record ShapeEntry(
@@ -108,11 +118,23 @@ public final class BlockShapeClient implements ClientModInitializer {
     public void onInitializeClient() {
         loadConfig();
 
+        ClientChunkEvents.CHUNK_LOAD.register((world, chunk) -> invalidateCache());
+        ClientChunkEvents.CHUNK_UNLOAD.register((world, chunk) -> invalidateCache());
+
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
-            if (client.level == null || client.player == null || !enabled) {
+            if (client.level == null || client.player == null) {
+                cachedLevel = null;
+                invalidateCache();
+                return;
+            }
+            if (!enabled) {
                 cachedShapes = List.of();
                 ticksSinceRefresh = REFRESH_INTERVAL_TICKS;
                 return;
+            }
+            if (cachedLevel != client.level) {
+                cachedLevel = client.level;
+                invalidateCache();
             }
             boolean ambientOcclusion = client.options.ambientOcclusion().get();
             boolean playerChangedBlock = !client.player.blockPosition().equals(lastCacheOrigin);
@@ -195,7 +217,14 @@ public final class BlockShapeClient implements ClientModInitializer {
                     boolean translucentTexture = false;
                     boolean specialTexture = false;
                     if (hiddenTextureBlock) {
-                        CachedTexture texture = buildHiddenTextureMesh(level, pos, state);
+                        CachedTexture texture;
+                        try {
+                            texture = buildHiddenTextureMesh(level, pos, state);
+                        } catch (RuntimeException exception) {
+                            logRenderFailure(state, exception);
+                            // Try the vanilla display-state path for a model the world tessellator rejects.
+                            texture = new CachedTexture(null, false, true);
+                        }
                         textureMesh = texture.mesh();
                         translucentTexture = texture.translucent();
                         specialTexture = texture.specialModel();
@@ -208,6 +237,18 @@ public final class BlockShapeClient implements ClientModInitializer {
             }
         }
         cachedShapes = List.copyOf(result);
+    }
+
+    private static void invalidateCache() {
+        cachedShapes = List.of();
+        ticksSinceRefresh = REFRESH_INTERVAL_TICKS;
+    }
+
+    private static void logRenderFailure(BlockState state, RuntimeException exception) {
+        String blockId = BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
+        if (LOGGED_RENDER_ERRORS.size() < MAX_LOGGED_RENDER_ERRORS && LOGGED_RENDER_ERRORS.add(blockId)) {
+            LOGGER.warn("Could not restore hidden texture for block {}. The renderer will keep running.", blockId, exception);
+        }
     }
 
     private static int colorForBlock(BlockState state) {
@@ -273,8 +314,9 @@ public final class BlockShapeClient implements ClientModInitializer {
                     } else {
                         submitSpecialHiddenBlockTexture(entry, poseStack, collector);
                     }
-                } catch (RuntimeException ignored) {
-                    // An unsupported third-party model must not break the whole world render.
+                } catch (RuntimeException exception) {
+                    // One broken third-party model must not break the whole world render.
+                    logRenderFailure(entry.state(), exception);
                 }
             }
 
@@ -420,12 +462,18 @@ public final class BlockShapeClient implements ClientModInitializer {
                                     + ", outlines=" + (renderOutlines ? "ON" : "OFF")
                                     + ", colors=" + (perBlockColors ? "per-block" : "fixed")
                                     + ", hidden textures=" + (renderHiddenTextures ? "ON" : "OFF"));
-                            feedback(context.getSource(), "Commands: /bshape on|off|toggle|outlines on|off|textures on|off|radius <2..16>|down <0..16>|up <0..16>|width <1..6>|color rainbow|color RRGGBB");
+                            feedback(context.getSource(), "Cached entries=" + cachedShapes.size() + ", unique render errors=" + LOGGED_RENDER_ERRORS.size());
+                            feedback(context.getSource(), "Commands: /bshape on|off|toggle|refresh|outlines on|off|textures on|off|radius <2..16>|down <0..16>|up <0..16>|width <1..6>|color rainbow|color RRGGBB");
                             return 1;
                         })
                         .then(ClientCommands.literal("on").executes(context -> setEnabled(context.getSource(), true)))
                         .then(ClientCommands.literal("off").executes(context -> setEnabled(context.getSource(), false)))
                         .then(ClientCommands.literal("toggle").executes(context -> setEnabled(context.getSource(), !enabled)))
+                        .then(ClientCommands.literal("refresh").executes(context -> {
+                            invalidateCache();
+                            feedback(context.getSource(), "Nearby block and texture cache will be rebuilt now");
+                            return 1;
+                        }))
                         .then(ClientCommands.literal("outlines")
                                 .then(ClientCommands.literal("on").executes(context -> setOutlines(context.getSource(), true)))
                                 .then(ClientCommands.literal("off").executes(context -> setOutlines(context.getSource(), false))))
