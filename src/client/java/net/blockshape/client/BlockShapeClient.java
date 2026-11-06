@@ -73,7 +73,7 @@ public final class BlockShapeClient implements ClientModInitializer {
     private static final int MAX_RADIUS = 16;
     private static final int MIN_VERTICAL_RANGE = 0;
     private static final int MAX_VERTICAL_RANGE = 16;
-    // Rebuild at most twice per second while standing still; movement is handled immediately.
+    // The balanced profile rebuilds twice per second; other profiles trade detail for speed.
     private static final int DEFAULT_REFRESH_INTERVAL_TICKS = 10;
     private static int refreshIntervalTicks = DEFAULT_REFRESH_INTERVAL_TICKS;
     private static final int[] EMPTY_QUAD_INDICES = new int[0];
