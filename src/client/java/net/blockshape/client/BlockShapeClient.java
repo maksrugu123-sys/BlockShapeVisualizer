@@ -423,7 +423,7 @@ public final class BlockShapeClient implements ClientModInitializer {
 
         job.cpuNanos += System.nanoTime() - passStarted;
         if (job.complete) {
-            List<ShapeEntry> previousBuffer = cachedShapes;
+            ArrayList<ShapeEntry> previousBuffer = cachedShapes;
             cachedShapes = cacheBuildEntries;
             cacheBuildEntries = previousBuffer;
             lastCacheOrigin = job.origin;
