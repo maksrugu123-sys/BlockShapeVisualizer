@@ -133,8 +133,8 @@ public final class BlockShapeClient implements ClientModInitializer {
     private static Method blockHiderShouldShowBlockEntity;
     // Two alternating buffers and reusable indexes reduce temporary allocation/GC
     // during repeated cache rebuilds, especially on mobile devices.
-    private static List<ShapeEntry> cachedShapes = new ArrayList<>();
-    private static List<ShapeEntry> cacheBuildEntries = new ArrayList<>();
+    private static ArrayList<ShapeEntry> cachedShapes = new ArrayList<>();
+    private static ArrayList<ShapeEntry> cacheBuildEntries = new ArrayList<>();
     private static final Map<BlockPos, ShapeEntry> previousByPosition = new HashMap<>();
     private static final Map<Long, Boolean> chunkAvailability = new HashMap<>();
     private static CacheBuildJob cacheBuildJob;
@@ -309,9 +309,7 @@ public final class BlockShapeClient implements ClientModInitializer {
         );
         int verticalSpan = downRange + upRange + 1;
         int expectedEntries = Math.max(16, (int) (Math.PI * radius * radius * verticalSpan));
-        if (cacheBuildEntries instanceof ArrayList<ShapeEntry> result) {
-            result.ensureCapacity(Math.min(expectedEntries, 120_000));
-        }
+        cacheBuildEntries.ensureCapacity(Math.min(expectedEntries, 120_000));
     }
 
     private static void continueCacheBuild() {
