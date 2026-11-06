@@ -388,9 +388,9 @@ public final class BlockShapeClient implements ClientModInitializer {
      */
     public static void invalidateBlockAndNeighbors(BlockPos changedPos) {
         if (cachedLevel == null) return;
-        int dx = changedPos.getX() - lastCacheOrigin.getX();
-        int dy = changedPos.getY() - lastCacheOrigin.getY();
-        int dz = changedPos.getZ() - lastCacheOrigin.getZ();
+        long dx = (long) changedPos.getX() - lastCacheOrigin.getX();
+        long dy = (long) changedPos.getY() - lastCacheOrigin.getY();
+        long dz = (long) changedPos.getZ() - lastCacheOrigin.getZ();
         if (dx * dx + dz * dz > (radius + 1) * (radius + 1)
                 || dy < -downRange - 1 || dy > upRange + 1) {
             return;
@@ -426,9 +426,9 @@ public final class BlockShapeClient implements ClientModInitializer {
         // Only chunks intersecting the active search circle can affect this cache.
         int nearestX = Math.max(minX, Math.min(maxX, lastCacheOrigin.getX()));
         int nearestZ = Math.max(minZ, Math.min(maxZ, lastCacheOrigin.getZ()));
-        int dx = nearestX - lastCacheOrigin.getX();
-        int dz = nearestZ - lastCacheOrigin.getZ();
-        int activeRadius = radius + 1;
+        long dx = (long) nearestX - lastCacheOrigin.getX();
+        long dz = (long) nearestZ - lastCacheOrigin.getZ();
+        long activeRadius = (long) radius + 1L;
         if (dx * dx + dz * dz > activeRadius * activeRadius) return;
 
         if (!cachedShapes.isEmpty()) {
