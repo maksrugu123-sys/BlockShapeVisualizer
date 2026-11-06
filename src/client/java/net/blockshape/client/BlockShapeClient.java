@@ -128,10 +128,10 @@ public final class BlockShapeClient implements ClientModInitializer {
     public void onInitializeClient() {
         loadConfig();
 
-        // Chunk streams can emit several events in one tick. Drop stale data now,
-        // but let the selected quality interval throttle the expensive rebuild.
-        ClientChunkEvents.CHUNK_LOAD.register((world, chunk) -> markCacheStale());
-        ClientChunkEvents.CHUNK_UNLOAD.register((world, chunk) -> markCacheStale());
+        // Invalidate only entries belonging to the changed chunk. The regular
+        // quality interval then rebuilds nearby meshes without clearing the whole view.
+        ClientChunkEvents.CHUNK_LOAD.register((world, chunk) -> invalidateChunkCache(chunk));
+        ClientChunkEvents.CHUNK_UNLOAD.register((world, chunk) -> invalidateChunkCache(chunk));
 
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             if (client.level == null || client.player == null) {
@@ -257,8 +257,15 @@ public final class BlockShapeClient implements ClientModInitializer {
         ticksSinceRefresh = refreshIntervalTicks;
     }
 
-    private static void markCacheStale() {
-        cachedShapes = List.of();
+    private static void invalidateChunkCache(net.minecraft.world.level.chunk.LevelChunk chunk) {
+        int changedChunkX = chunk.getPos().x;
+        int changedChunkZ = chunk.getPos().z;
+        if (!cachedShapes.isEmpty()) {
+            cachedShapes = cachedShapes.stream()
+                    .filter(entry -> (entry.pos().getX() >> 4) != changedChunkX
+                            || (entry.pos().getZ() >> 4) != changedChunkZ)
+                    .toList();
+        }
     }
 
     private static void logRenderFailure(BlockState state, RuntimeException exception) {
