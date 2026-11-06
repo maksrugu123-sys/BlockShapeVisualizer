@@ -46,6 +46,7 @@ import net.minecraft.world.level.block.RenderShape;
 import net.minecraft.world.level.block.SnowLayerBlock;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.biome.Biome;
+import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.phys.shapes.CollisionContext;
@@ -161,6 +162,7 @@ public final class BlockShapeClient implements ClientModInitializer {
 
     private record ShapeEntry(
             BlockPos pos,
+            AABB bounds,
             BlockState state,
             VoxelShape shape,
             int color,
@@ -392,8 +394,16 @@ public final class BlockShapeClient implements ClientModInitializer {
                                 }
                             }
 
+                            AABB bounds = new AABB(
+                                    pos.getX() - 0.25,
+                                    pos.getY() - 0.25,
+                                    pos.getZ() - 0.25,
+                                    pos.getX() + 1.25,
+                                    pos.getY() + 1.25,
+                                    pos.getZ() + 1.25
+                            );
                             cacheBuildEntries.add(new ShapeEntry(
-                                    pos, state, shape, color, textureCacheKey,
+                                    pos, bounds, state, shape, color, textureCacheKey,
                                     textureMesh, translucentTexture, specialTexture
                             ));
                         }
@@ -702,11 +712,16 @@ public final class BlockShapeClient implements ClientModInitializer {
         Level level = Minecraft.getInstance().level;
         if (level == null) return;
 
-        Vec3 camera = context.levelState().cameraRenderState.pos;
+        var cameraState = context.levelState().cameraRenderState;
+        Vec3 camera = cameraState.pos;
+        var frustum = cameraState.cullFrustum;
         PoseStack poseStack = context.poseStack();
         SubmitNodeCollector collector = context.submitNodeCollector();
 
         for (ShapeEntry entry : cachedShapes) {
+            // Cull blocks outside the camera view before creating submit nodes.
+            if (frustum != null && !frustum.isVisible(entry.bounds())) continue;
+
             boolean drawHiddenTexture = renderHiddenTextures
                     && entry.state().getRenderShape() == RenderShape.INVISIBLE
                     && (entry.hiddenTextureMesh() != null || entry.specialHiddenTexture());
