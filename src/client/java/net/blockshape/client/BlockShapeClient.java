@@ -80,6 +80,7 @@ public final class BlockShapeClient implements ClientModInitializer {
     private static final Logger LOGGER = LoggerFactory.getLogger("blockshape");
     private static final int MAX_LOGGED_RENDER_ERRORS = 128;
     private static final Set<String> LOGGED_RENDER_ERRORS = new HashSet<>();
+    private static final Set<String> DISABLED_TEXTURE_BLOCK_IDS = new HashSet<>();
     private static final Map<Block, Integer> BLOCK_COLOR_CACHE = new IdentityHashMap<>();
     private static final Path CONFIG_FILE = FabricLoader.getInstance().getConfigDir()
             .resolve("blockshape-visualizer.properties");
@@ -276,6 +277,8 @@ public final class BlockShapeClient implements ClientModInitializer {
     }
 
     private static boolean shouldRestoreHiddenTextureCategory(BlockState state) {
+        String blockId = BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
+        if (DISABLED_TEXTURE_BLOCK_IDS.contains(blockId)) return false;
         if (state.is(BlockTags.PORTALS) || state.is(Blocks.END_GATEWAY)) return categoryPortals;
         if (state.is(BlockTags.FIRE) || state.is(BlockTags.CAMPFIRES)) return categoryFire;
         if (isPlantBlock(state)) return categoryPlants;
@@ -534,7 +537,7 @@ public final class BlockShapeClient implements ClientModInitializer {
                                     + ", hidden textures=" + (renderHiddenTextures ? "ON" : "OFF"));
                             feedback(context.getSource(), "Категории L/P/F/G/M = жидкости/порталы/огонь/растения/спецмодели; ON означает обработку категории.");
                             feedback(context.getSource(), "Cached entries=" + cachedShapes.size() + ", unique render errors=" + LOGGED_RENDER_ERRORS.size());
-                            feedback(context.getSource(), "Commands: /bshape on|off|toggle|refresh|quality low|balanced|high|category <liquids|portals|fire|plants|special> <on|off>|outlines on|off|textures on|off|radius <2..16>|down <0..16>|up <0..16>|width <1..6>|color rainbow|color RRGGBB");
+                            feedback(context.getSource(), "Commands: /bshape on|off|toggle|refresh|reset|block <namespace:id> <on|off>|quality low|balanced|high|category <liquids|portals|fire|plants|special> <on|off>|outlines on|off|textures on|off|radius <2..16>|down <0..16>|up <0..16>|width <1..6>|color rainbow|color RRGGBB");
                             return 1;
                         })
                         .then(ClientCommands.literal("on").executes(context -> setEnabled(context.getSource(), true)))
@@ -556,6 +559,12 @@ public final class BlockShapeClient implements ClientModInitializer {
                                 .then(textureCategoryCommand("fire"))
                                 .then(textureCategoryCommand("plants"))
                                 .then(textureCategoryCommand("special")))
+                        .then(ClientCommands.literal("block")
+                                .then(ClientCommands.argument("id", StringArgumentType.word())
+                                        .then(ClientCommands.literal("on").executes(context ->
+                                                setBlockTexture(context.getSource(), StringArgumentType.getString(context, "id"), true)))
+                                        .then(ClientCommands.literal("off").executes(context ->
+                                                setBlockTexture(context.getSource(), StringArgumentType.getString(context, "id"), false)))))
                         .then(ClientCommands.literal("outlines")
                                 .then(ClientCommands.literal("on").executes(context -> setOutlines(context.getSource(), true)))
                                 .then(ClientCommands.literal("off").executes(context -> setOutlines(context.getSource(), false))))
@@ -618,6 +627,22 @@ public final class BlockShapeClient implements ClientModInitializer {
                                 })))
                 )
         );
+    }
+
+    private static int setBlockTexture(FabricClientCommandSource source, String id, boolean enabled) {
+        if (!id.matches("[a-z0-9_.-]+:[a-z0-9/._-]+")) {
+            source.sendError(Component.literal("[BlockShape] Use a block ID such as minecraft:stone"));
+            return 0;
+        }
+        if (enabled) {
+            DISABLED_TEXTURE_BLOCK_IDS.remove(id);
+        } else {
+            DISABLED_TEXTURE_BLOCK_IDS.add(id);
+        }
+        invalidateCache();
+        saveConfig();
+        feedback(source, "Block texture restoration " + (enabled ? "enabled" : "disabled") + " for " + id);
+        return 1;
     }
 
     private static com.mojang.brigadier.builder.LiteralArgumentBuilder<FabricClientCommandSource> textureCategoryCommand(String name) {
@@ -691,6 +716,7 @@ public final class BlockShapeClient implements ClientModInitializer {
         categoryFire = true;
         categoryPlants = true;
         categorySpecialModels = true;
+        DISABLED_TEXTURE_BLOCK_IDS.clear();
         radius = 6;
         downRange = 3;
         upRange = 3;
@@ -753,6 +779,11 @@ public final class BlockShapeClient implements ClientModInitializer {
             categoryFire = Boolean.parseBoolean(properties.getProperty("categoryFire", "true"));
             categoryPlants = Boolean.parseBoolean(properties.getProperty("categoryPlants", "true"));
             categorySpecialModels = Boolean.parseBoolean(properties.getProperty("categorySpecialModels", "true"));
+            DISABLED_TEXTURE_BLOCK_IDS.clear();
+            String disabledIds = properties.getProperty("disabledTextureBlockIds", "");
+            for (String id : disabledIds.split(",")) {
+                if (id.matches("[a-z0-9_.-]+:[a-z0-9/._-]+")) DISABLED_TEXTURE_BLOCK_IDS.add(id);
+            }
             radius = clamp(parseInt(properties.getProperty("radius"), 6), MIN_RADIUS, MAX_RADIUS);
             downRange = clamp(parseInt(properties.getProperty("downRange"), 3), MIN_VERTICAL_RANGE, MAX_VERTICAL_RANGE);
             upRange = clamp(parseInt(properties.getProperty("upRange"), 3), MIN_VERTICAL_RANGE, MAX_VERTICAL_RANGE);
@@ -777,6 +808,7 @@ public final class BlockShapeClient implements ClientModInitializer {
         properties.setProperty("categoryFire", Boolean.toString(categoryFire));
         properties.setProperty("categoryPlants", Boolean.toString(categoryPlants));
         properties.setProperty("categorySpecialModels", Boolean.toString(categorySpecialModels));
+        properties.setProperty("disabledTextureBlockIds", String.join(",", DISABLED_TEXTURE_BLOCK_IDS));
         properties.setProperty("radius", Integer.toString(radius));
         properties.setProperty("downRange", Integer.toString(downRange));
         properties.setProperty("upRange", Integer.toString(upRange));
