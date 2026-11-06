@@ -173,6 +173,8 @@ public final class BlockShapeClient implements ClientModInitializer {
             }
             if (!enabled) {
                 cachedShapes = List.of();
+                lastReusedEntries = 0;
+                lastRebuiltEntries = 0;
                 ticksSinceRefresh = refreshIntervalTicks;
                 return;
             }
