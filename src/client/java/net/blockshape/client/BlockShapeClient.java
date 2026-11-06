@@ -303,6 +303,9 @@ public final class BlockShapeClient implements ClientModInitializer {
         if (state.is(Blocks.END_PORTAL) || state.is(BlockTags.PORTALS) || state.is(Blocks.END_GATEWAY)) return categoryPortals;
         if (state.is(BlockTags.FIRE) || state.is(BlockTags.CAMPFIRES)) return categoryFire;
         if (isPlantBlock(state)) return categoryPlants;
+        // Some block entities use an ordinary-looking baked block model. They
+        // still belong to Special Models and must respect that category switch.
+        if (state.hasBlockEntity()) return categorySpecialModels;
         return true;
     }
 
