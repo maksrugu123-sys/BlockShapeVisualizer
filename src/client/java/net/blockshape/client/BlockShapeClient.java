@@ -45,6 +45,8 @@ import net.minecraft.world.level.block.BushBlock;
 import net.minecraft.world.level.block.RenderShape;
 import net.minecraft.world.level.block.SnowLayerBlock;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.chunk.ChunkStatus;
+import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.biome.Biome;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.BlockHitResult;
@@ -138,6 +140,7 @@ public final class BlockShapeClient implements ClientModInitializer {
     private static ArrayList<ShapeEntry> cacheBuildEntries = new ArrayList<>();
     private static final Map<BlockPos, ShapeEntry> previousByPosition = new HashMap<>();
     private static final Map<Long, Boolean> chunkAvailability = new HashMap<>();
+    private static final Map<Long, Boolean> nonEmptySectionCache = new HashMap<>();
     private static CacheBuildJob cacheBuildJob;
     private static boolean cacheDirty = true;
     private static int lastReusedEntries;
@@ -297,6 +300,7 @@ public final class BlockShapeClient implements ClientModInitializer {
             previousByPosition.put(previous.pos(), previous);
         }
         chunkAvailability.clear();
+        nonEmptySectionCache.clear();
 
         boolean ambientOcclusion = Minecraft.getInstance().options.ambientOcclusion().get();
         cacheBuildJob = new CacheBuildJob(
@@ -334,7 +338,8 @@ public final class BlockShapeClient implements ClientModInitializer {
                         job.origin.getZ() + z
                 );
 
-                if (isChunkLoaded(job.level, job.cursor, chunkAvailability)) {
+                if (hasNonEmptySection(job.level, job.cursor, nonEmptySectionCache)
+                        && isChunkLoaded(job.level, job.cursor, chunkAvailability)) {
                     BlockState state = job.level.getBlockState(job.cursor);
                     if (!state.isAir()) {
                         BlockPos pos = job.cursor.immutable();
@@ -430,6 +435,7 @@ public final class BlockShapeClient implements ClientModInitializer {
             cacheBuildJob = null;
             previousByPosition.clear();
             chunkAvailability.clear();
+            nonEmptySectionCache.clear();
         }
     }
 
@@ -453,6 +459,7 @@ public final class BlockShapeClient implements ClientModInitializer {
         cacheBuildEntries.clear();
         previousByPosition.clear();
         chunkAvailability.clear();
+        nonEmptySectionCache.clear();
     }
 
     private static void registerResourceReloadListener() {
@@ -473,6 +480,36 @@ public final class BlockShapeClient implements ClientModInitializer {
                     }
                 }
         );
+    }
+
+    /**
+     * Skip entire all-air chunk sections before querying individual block states.
+     * Section status is cached for the duration of one incremental build.
+     */
+    private static boolean hasNonEmptySection(
+            ClientLevel level,
+            BlockPos pos,
+            Map<Long, Boolean> sectionCache
+    ) {
+        int y = pos.getY();
+        if (level.isOutsideBuildHeight(y)) return false;
+
+        int chunkX = pos.getX() >> 4;
+        int chunkZ = pos.getZ() >> 4;
+        int sectionIndex = level.getSectionIndex(y);
+        long key = (((long) chunkX & 0x3FFFFFFL) << 38)
+                | (((long) chunkZ & 0x3FFFFFFL) << 12)
+                | (sectionIndex & 0xFFFL);
+
+        Boolean nonEmpty = sectionCache.get(key);
+        if (nonEmpty == null) {
+            LevelChunk chunk = level.getChunkSource().getChunk(
+                    chunkX, chunkZ, ChunkStatus.FULL, false
+            );
+            nonEmpty = chunk != null && !chunk.getSection(sectionIndex).hasOnlyAir();
+            sectionCache.put(key, nonEmpty);
+        }
+        return nonEmpty;
     }
 
     private static boolean isChunkLoaded(
