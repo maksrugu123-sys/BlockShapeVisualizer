@@ -416,7 +416,6 @@ public final class BlockShapeClient implements ClientModInitializer {
                             boolean specialTexture = false;
 
                             if (hiddenTextureBlock) {
-                                ShapeEntry previous = previousByPosition.get(pos);
                                 if (previous != null && textureCacheKey.equals(previous.textureCacheKey())) {
                                     textureMesh = previous.hiddenTextureMesh();
                                     translucentTexture = previous.translucentHiddenTexture();
