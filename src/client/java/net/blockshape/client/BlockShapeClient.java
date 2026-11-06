@@ -833,7 +833,7 @@ public final class BlockShapeClient implements ClientModInitializer {
         if (state.is(Blocks.END_PORTAL) || state.is(BlockTags.PORTALS) || state.is(Blocks.END_GATEWAY)) return "portals";
         if (state.is(BlockTags.FIRE) || state.is(BlockTags.CAMPFIRES)) return "fire";
         if (isPlantBlock(state)) return "plants";
-        return specialModel ? "special models" : "regular block";
+        return specialModel || state.hasBlockEntity() ? "special models" : "regular block";
     }
 
     private static int resetSettings(FabricClientCommandSource source) {
