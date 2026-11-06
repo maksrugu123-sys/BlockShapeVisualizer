@@ -121,6 +121,8 @@ public final class BlockShapeClient implements ClientModInitializer {
     private static BlockPos lastCacheOrigin = BlockPos.ZERO;
     private static ClientLevel cachedLevel;
     private static List<ShapeEntry> cachedShapes = List.of();
+    private static int lastReusedMeshes;
+    private static int lastRebuiltMeshes;
 
     private record NeighborSnapshot(BlockState state, int packedLight) {}
 
@@ -208,6 +210,8 @@ public final class BlockShapeClient implements ClientModInitializer {
         int expectedEntries = Math.max(16, (int) (Math.PI * radiusSquared * verticalSpan));
         List<ShapeEntry> result = new ArrayList<>(expectedEntries);
         Map<Long, Boolean> chunkAvailability = new HashMap<>();
+        int reusedMeshes = 0;
+        int rebuiltMeshes = 0;
         Map<BlockPos, ShapeEntry> previousByPosition = new HashMap<>(cachedShapes.size());
         for (ShapeEntry previous : cachedShapes) {
             previousByPosition.put(previous.pos(), previous);
@@ -266,7 +270,9 @@ public final class BlockShapeClient implements ClientModInitializer {
                             textureMesh = previous.hiddenTextureMesh();
                             translucentTexture = previous.translucentHiddenTexture();
                             specialTexture = previous.specialHiddenTexture();
+                            reusedMeshes++;
                         } else {
+                            rebuiltMeshes++;
                             CachedTexture texture;
                             try {
                                 texture = buildHiddenTextureMesh(level, pos, state);
@@ -288,6 +294,8 @@ public final class BlockShapeClient implements ClientModInitializer {
             }
         }
         cachedShapes = List.copyOf(result);
+        lastReusedMeshes = reusedMeshes;
+        lastRebuiltMeshes = rebuiltMeshes;
     }
 
     private static void registerResourceReloadListener() {
@@ -717,7 +725,7 @@ public final class BlockShapeClient implements ClientModInitializer {
                                     + ", colors=" + (perBlockColors ? "per-block" : "fixed")
                                     + ", hidden textures=" + (renderHiddenTextures ? "ON" : "OFF"));
                             feedback(context.getSource(), "Категории L/P/F/G/M = жидкости/порталы/огонь/растения/спецмодели; ON означает обработку категории.");
-                            feedback(context.getSource(), "Cached entries=" + cachedShapes.size() + ", unique render errors=" + LOGGED_RENDER_ERRORS.size());
+                            feedback(context.getSource(), "Cached entries=" + cachedShapes.size() + ", meshes reused=" + lastReusedMeshes + ", rebuilt=" + lastRebuiltMeshes + ", unique render errors=" + LOGGED_RENDER_ERRORS.size());
                             feedback(context.getSource(), "Commands: /bshape on|off|toggle|inspect|refresh|reload|reset|block <namespace:id> <on|off>|namespace <name> <on|off>|quality low|balanced|high|category <liquids|portals|fire|plants|special> <on|off>|outlines on|off|textures on|off|radius <2..16>|down <0..16>|up <0..16>|width <1..6>|color rainbow|color RRGGBB");
                             return 1;
                         })
