@@ -72,6 +72,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
@@ -148,6 +149,7 @@ public final class BlockShapeClient implements ClientModInitializer {
     private static ArrayList<ShapeEntry> cachedShapes = new ArrayList<>();
     private static ArrayList<ShapeEntry> cacheBuildEntries = new ArrayList<>();
     private static final Map<BlockPos, ShapeEntry> previousByPosition = new HashMap<>();
+    private static final Map<Long, ShapeChunkBucket> cachedChunkBuckets = new LinkedHashMap<>();
     private static final Map<Long, Boolean> chunkAvailability = new HashMap<>();
     private static final Map<Long, Boolean> nonEmptySectionCache = new HashMap<>();
     // Event-driven dirty positions are deduplicated and consumed by the next cache job.
@@ -191,6 +193,9 @@ public final class BlockShapeClient implements ClientModInitializer {
     ) {}
 
     private record CachedTexture(Mesh mesh, boolean translucent, boolean specialModel) {}
+
+    /** Coarse buckets allow whole 16x16x16 chunk sections to be rejected before block checks. */
+    private record ShapeChunkBucket(AABB bounds, ArrayList<ShapeEntry> entries) {}
 
     /** A cache build is spread across several client ticks to avoid one-frame spikes. */
     private static final class CacheBuildJob {
@@ -275,6 +280,7 @@ public final class BlockShapeClient implements ClientModInitializer {
                 cancelCacheBuild();
                 cachedShapes.clear();
                 cacheBuildEntries.clear();
+                cachedChunkBuckets.clear();
                 lastReusedEntries = 0;
                 lastRebuiltEntries = 0;
                 lastScannedPositions = 0;
@@ -383,8 +389,12 @@ public final class BlockShapeClient implements ClientModInitializer {
         long passStarted = System.nanoTime();
         int positionsRemaining = Math.max(256, (int) (scanBudgetPerTick * adaptiveBudgetScale));
         int textureBuildsRemaining = Math.max(1, (int) (textureBuildBudgetPerTick * adaptiveBudgetScale));
+        int positionsProcessedThisSlice = 0;
 
-        while (positionsRemaining > 0 && !job.complete) {
+        // Enforce a real CPU time slice instead of only adapting the next tick's scan count.
+        while (positionsRemaining > 0 && !job.complete
+                && (positionsProcessedThisSlice == 0
+                || System.nanoTime() - passStarted < CACHE_SLICE_TARGET_NANOS)) {
             if (job.pendingPosition == null) {
                 if (job.partialMode) {
                     if (!job.dirtyIterator.hasNext()) {
@@ -502,6 +512,7 @@ public final class BlockShapeClient implements ClientModInitializer {
             }
 
             job.scannedPositions++;
+            positionsProcessedThisSlice++;
             positionsRemaining--;
             job.pendingPosition = null;
             if (!job.partialMode) {
@@ -534,6 +545,7 @@ public final class BlockShapeClient implements ClientModInitializer {
             lastScannedPositions = job.scannedPositions;
             lastRebuildMillis = job.cpuNanos / 1_000_000.0;
             cacheBuildJob = null;
+            rebuildChunkBuckets();
             previousByPosition.clear();
             chunkAvailability.clear();
             nonEmptySectionCache.clear();
@@ -673,6 +685,7 @@ public final class BlockShapeClient implements ClientModInitializer {
     private static void invalidateCache() {
         cancelCacheBuild();
         cachedShapes.clear();
+        cachedChunkBuckets.clear();
         lastReusedEntries = 0;
         lastRebuiltEntries = 0;
         lastScannedPositions = 0;
@@ -901,8 +914,34 @@ public final class BlockShapeClient implements ClientModInitializer {
         return ((int) (red * 255.0f) << 16) | ((int) (green * 255.0f) << 8) | (int) (blue * 255.0f);
     }
 
+    private static void rebuildChunkBuckets() {
+        cachedChunkBuckets.clear();
+        for (ShapeEntry entry : cachedShapes) {
+            int chunkX = entry.pos().getX() >> 4;
+            int sectionY = entry.pos().getY() >> 4;
+            int chunkZ = entry.pos().getZ() >> 4;
+            long key = (((long) chunkX & 0x3FFFFFFL) << 38)
+                    | (((long) chunkZ & 0x3FFFFFFL) << 12)
+                    | (sectionY & 0xFFFL);
+
+            ShapeChunkBucket bucket = cachedChunkBuckets.get(key);
+            if (bucket == null) {
+                double minX = (double) chunkX * 16.0;
+                double minY = (double) sectionY * 16.0;
+                double minZ = (double) chunkZ * 16.0;
+                AABB bounds = new AABB(
+                        minX - 0.25, minY - 0.25, minZ - 0.25,
+                        minX + 16.25, minY + 16.25, minZ + 16.25
+                );
+                bucket = new ShapeChunkBucket(bounds, new ArrayList<>());
+                cachedChunkBuckets.put(key, bucket);
+            }
+            bucket.entries().add(entry);
+        }
+    }
+
     private void submitShapes(LevelRenderContext context) {
-        if (!enabled || cachedShapes.isEmpty()) return;
+        if (!enabled || cachedShapes.isEmpty() || (!renderOutlines && !renderHiddenTextures)) return;
 
         Minecraft minecraft = Minecraft.getInstance();
         Level level = minecraft.level;
@@ -920,8 +959,11 @@ public final class BlockShapeClient implements ClientModInitializer {
         PoseStack poseStack = context.poseStack();
         SubmitNodeCollector collector = context.submitNodeCollector();
 
-        for (ShapeEntry entry : cachedShapes) {
-            int dx = entry.pos().getX() - currentOrigin.getX();
+        for (ShapeChunkBucket bucket : cachedChunkBuckets.values()) {
+            // Reject an entire section before visiting the cached blocks inside it.
+            if (frustum != null && !frustum.isVisible(bucket.bounds())) continue;
+            for (ShapeEntry entry : bucket.entries()) {
+                int dx = entry.pos().getX() - currentOrigin.getX();
             int dy = entry.pos().getY() - currentOrigin.getY();
             int dz = entry.pos().getZ() - currentOrigin.getZ();
             // The active cache may finish a progressive rebuild after the player moves.
@@ -977,6 +1019,7 @@ public final class BlockShapeClient implements ClientModInitializer {
             } finally {
                 // Preserve the caller's pose even if a renderer or outline submission fails.
                 poseStack.popPose();
+            }
             }
         }
     }
