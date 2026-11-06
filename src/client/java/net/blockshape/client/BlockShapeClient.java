@@ -84,6 +84,7 @@ public final class BlockShapeClient implements ClientModInitializer {
     private static final int MAX_VERTICAL_RANGE = 16;
     // The balanced profile rebuilds twice per second; other profiles trade detail for speed.
     private static final int DEFAULT_REFRESH_INTERVAL_TICKS = 10;
+    private static final int MOVEMENT_REFRESH_DISTANCE_SQUARED = 4;
     private static int refreshIntervalTicks = DEFAULT_REFRESH_INTERVAL_TICKS;
     private static final int[] EMPTY_QUAD_INDICES = new int[0];
     private static final Logger LOGGER = LoggerFactory.getLogger("blockshape");
@@ -183,8 +184,13 @@ public final class BlockShapeClient implements ClientModInitializer {
                 invalidateCache();
             }
             boolean ambientOcclusion = client.options.ambientOcclusion().get();
-            boolean playerChangedBlock = !client.player.blockPosition().equals(lastCacheOrigin);
-            if (playerChangedBlock
+            BlockPos currentOrigin = client.player.blockPosition();
+            long moveX = (long) currentOrigin.getX() - lastCacheOrigin.getX();
+            long moveY = (long) currentOrigin.getY() - lastCacheOrigin.getY();
+            long moveZ = (long) currentOrigin.getZ() - lastCacheOrigin.getZ();
+            boolean playerMovedEnough = moveX * moveX + moveY * moveY + moveZ * moveZ
+                    >= MOVEMENT_REFRESH_DISTANCE_SQUARED;
+            if (playerMovedEnough
                     || ++ticksSinceRefresh >= refreshIntervalTicks
                     || cachedAmbientOcclusion != ambientOcclusion) {
                 ticksSinceRefresh = 0;
@@ -398,23 +404,9 @@ public final class BlockShapeClient implements ClientModInitializer {
             return;
         }
 
-        int minX = changedPos.getX() - 1;
-        int maxX = changedPos.getX() + 1;
-        int minY = changedPos.getY() - 1;
-        int maxY = changedPos.getY() + 1;
-        int minZ = changedPos.getZ() - 1;
-        int maxZ = changedPos.getZ() + 1;
-        if (!cachedShapes.isEmpty()) {
-            cachedShapes = cachedShapes.stream()
-                    .filter(entry -> {
-                        BlockPos pos = entry.pos();
-                        return pos.getX() < minX || pos.getX() > maxX
-                                || pos.getY() < minY || pos.getY() > maxY
-                                || pos.getZ() < minZ || pos.getZ() > maxZ;
-                    })
-                    .toList();
-        }
-        // Includes newly placed blocks that were air and therefore had no old cache entry.
+        // The complete nearby cache is rebuilt on the next client tick.
+        // Batch block changes instead of filtering/copying the same list for every
+        // setBlock call, which can happen hundreds of times during chunk updates.
         ticksSinceRefresh = refreshIntervalTicks;
     }
 
@@ -425,7 +417,6 @@ public final class BlockShapeClient implements ClientModInitializer {
         int maxX = minX + 15;
         int maxZ = minZ + 15;
 
-        // Only chunks intersecting the active search circle can affect this cache.
         int nearestX = Math.max(minX, Math.min(maxX, lastCacheOrigin.getX()));
         int nearestZ = Math.max(minZ, Math.min(maxZ, lastCacheOrigin.getZ()));
         long dx = (long) nearestX - lastCacheOrigin.getX();
@@ -433,24 +424,7 @@ public final class BlockShapeClient implements ClientModInitializer {
         long activeRadius = (long) radius + 1L;
         if (dx * dx + dz * dz > activeRadius * activeRadius) return;
 
-        if (!cachedShapes.isEmpty()) {
-            cachedShapes = cachedShapes.stream()
-                    .filter(entry -> {
-                        int x = entry.pos().getX();
-                        int z = entry.pos().getZ();
-                        boolean insideChangedChunk = x >= minX && x <= maxX
-                                && z >= minZ && z <= maxZ;
-                        // Face culling for blocks directly across a chunk edge depends
-                        // on the neighbor chunk too, so invalidate this one-block border.
-                        boolean touchesChangedXEdge = (x == minX - 1 || x == maxX + 1)
-                                && z >= minZ && z <= maxZ;
-                        boolean touchesChangedZEdge = (z == minZ - 1 || z == maxZ + 1)
-                                && x >= minX && x <= maxX;
-                        return !insideChangedChunk && !touchesChangedXEdge && !touchesChangedZEdge;
-                    })
-                    .toList();
-        }
-        // Also rebuild when the chunk enters the active area for the first time.
+        // Chunk load/unload events are coalesced into the same next-tick rebuild.
         ticksSinceRefresh = refreshIntervalTicks;
     }
 
@@ -794,7 +768,7 @@ public final class BlockShapeClient implements ClientModInitializer {
                                     + ", hidden textures=" + (renderHiddenTextures ? "ON" : "OFF"));
                             feedback(context.getSource(), "Категории L/P/F/G/M = жидкости/порталы/огонь/растения/спецмодели; ON означает обработку категории.");
                             feedback(context.getSource(), "Cached entries=" + cachedShapes.size() + ", texture cache entries reused=" + lastReusedEntries + ", rebuilt=" + lastRebuiltEntries + ", unique render errors=" + LOGGED_RENDER_ERRORS.size());
-                            feedback(context.getSource(), "Commands: /bshape on|off|toggle|inspect|refresh|reload|reset|block <namespace:id> <on|off>|namespace <name> <on|off>|quality low|balanced|high|category <liquids|portals|fire|plants|special> <on|off>|outlines on|off|textures on|off|radius <2..16>|down <0..16>|up <0..16>|width <1..6>|color rainbow|color RRGGBB");
+                            feedback(context.getSource(), "Commands: /bshape on|off|toggle|inspect|refresh|reload|reset|block <namespace:id> <on|off>|namespace <name> <on|off>|quality performance|low|balanced|high|category <liquids|portals|fire|plants|special> <on|off>|outlines on|off|textures on|off|radius <2..16>|down <0..16>|up <0..16>|width <1..6>|color rainbow|color RRGGBB");
                             return 1;
                         })
                         .then(ClientCommands.literal("on").executes(context -> setEnabled(context.getSource(), true)))
@@ -817,6 +791,7 @@ public final class BlockShapeClient implements ClientModInitializer {
                         }))
                         .then(ClientCommands.literal("reset").executes(context -> resetSettings(context.getSource())))
                         .then(ClientCommands.literal("quality")
+                                .then(ClientCommands.literal("performance").executes(context -> setQuality(context.getSource(), "performance")))
                                 .then(ClientCommands.literal("low").executes(context -> setQuality(context.getSource(), "low")))
                                 .then(ClientCommands.literal("balanced").executes(context -> setQuality(context.getSource(), "balanced")))
                                 .then(ClientCommands.literal("high").executes(context -> setQuality(context.getSource(), "high"))))
@@ -975,6 +950,13 @@ public final class BlockShapeClient implements ClientModInitializer {
 
     private static void applyQualityPreset(String preset) {
         switch (preset) {
+            case "performance" -> {
+                // Aggressive mobile profile: small scan volume and infrequent rebuilds.
+                radius = 3;
+                downRange = 1;
+                upRange = 1;
+                refreshIntervalTicks = 30;
+            }
             case "low" -> {
                 radius = 4;
                 downRange = 2;
@@ -1142,8 +1124,9 @@ public final class BlockShapeClient implements ClientModInitializer {
         try (Reader reader = Files.newBufferedReader(CONFIG_FILE)) {
             properties.load(reader);
             qualityPreset = properties.getProperty("quality", "balanced");
-            if (!qualityPreset.equals("low") && !qualityPreset.equals("balanced")
-                    && !qualityPreset.equals("high") && !qualityPreset.equals("custom")) {
+            if (!qualityPreset.equals("performance") && !qualityPreset.equals("low")
+                    && !qualityPreset.equals("balanced") && !qualityPreset.equals("high")
+                    && !qualityPreset.equals("custom")) {
                 qualityPreset = "balanced";
             }
             applyQualityPreset(qualityPreset);
